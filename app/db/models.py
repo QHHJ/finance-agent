@@ -3,7 +3,7 @@ from __future__ import annotations
 from datetime import datetime
 from uuid import uuid4
 
-from sqlalchemy import DateTime, ForeignKey, Integer, JSON, String, Text
+from sqlalchemy import DateTime, ForeignKey, Integer, JSON, String, Text, UniqueConstraint
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from .session import Base
@@ -53,3 +53,24 @@ class CorrectionLog(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, nullable=False)
 
     task: Mapped["ExpenseTask"] = relationship(back_populates="corrections")
+
+
+class RagVectorDocument(Base):
+    __tablename__ = "rag_vector_documents"
+    __table_args__ = (UniqueConstraint("doc_key", name="uq_rag_vector_documents_doc_key"),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    source_type: Mapped[str] = mapped_column(String(50), nullable=False, index=True)
+    source_id: Mapped[str] = mapped_column(String(100), nullable=False, index=True)
+    doc_key: Mapped[str] = mapped_column(String(255), nullable=False, index=True)
+    title: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    content: Mapped[str] = mapped_column(Text, nullable=False)
+    metadata_json: Mapped[dict] = mapped_column(JSON, default=dict, nullable=False)
+    embedding: Mapped[list[float]] = mapped_column(JSON, default=list, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime,
+        default=datetime.utcnow,
+        onupdate=datetime.utcnow,
+        nullable=False,
+    )

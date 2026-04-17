@@ -7,7 +7,7 @@ from typing import Any
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from .models import CorrectionLog, ExpenseTask, PolicyDocument
+from .models import CorrectionLog, ExpenseTask, PolicyDocument, RagVectorDocument
 
 
 def _to_text(value: Any) -> str | None:
@@ -65,6 +65,9 @@ def save_processing_result(
         "required_materials": suggestion_data.get("required_materials", []),
         "risk_points": suggestion_data.get("risk_points", []),
         "policy_references": suggestion_data.get("policy_references", []),
+        "similar_case_refs": suggestion_data.get("similar_case_refs", []),
+        "rationale": suggestion_data.get("rationale", ""),
+        "rag_trace": suggestion_data.get("rag_trace", {}),
         "extracted_fields": extracted_data,
     }
     task.status = "completed"
@@ -196,9 +199,86 @@ def delete_policy_document(db: Session, policy_id: int) -> str | None:
     if policy is None:
         return None
     stored_path = policy.stored_path
+    rag_stmt = select(RagVectorDocument).where(
+        RagVectorDocument.source_type == "policy",
+        RagVectorDocument.source_id == str(policy_id),
+    )
+    for rag_doc in db.scalars(rag_stmt):
+        db.delete(rag_doc)
     db.delete(policy)
     db.commit()
     return stored_path
+
+
+def upsert_rag_document(
+    db: Session,
+    *,
+    source_type: str,
+    source_id: str,
+    doc_key: str,
+    content: str,
+    embedding: list[float],
+    title: str | None = None,
+    metadata_json: dict[str, Any] | None = None,
+) -> RagVectorDocument:
+    stmt = select(RagVectorDocument).where(RagVectorDocument.doc_key == doc_key)
+    doc = db.scalar(stmt)
+    if doc is None:
+        doc = RagVectorDocument(
+            source_type=source_type,
+            source_id=source_id,
+            doc_key=doc_key,
+            title=title,
+            content=content,
+            metadata_json=metadata_json or {},
+            embedding=embedding,
+        )
+        db.add(doc)
+    else:
+        doc.source_type = source_type
+        doc.source_id = source_id
+        doc.title = title
+        doc.content = content
+        doc.metadata_json = metadata_json or {}
+        doc.embedding = embedding
+
+    db.flush()
+    db.refresh(doc)
+    return doc
+
+
+def delete_rag_documents(
+    db: Session,
+    *,
+    source_type: str | None = None,
+    source_id: str | None = None,
+    doc_key_prefix: str | None = None,
+) -> int:
+    stmt = select(RagVectorDocument)
+    if source_type:
+        stmt = stmt.where(RagVectorDocument.source_type == source_type)
+    if source_id:
+        stmt = stmt.where(RagVectorDocument.source_id == source_id)
+    if doc_key_prefix:
+        stmt = stmt.where(RagVectorDocument.doc_key.like(f"{doc_key_prefix}%"))
+
+    docs = list(db.scalars(stmt))
+    for doc in docs:
+        db.delete(doc)
+    db.flush()
+    return len(docs)
+
+
+def list_rag_documents(
+    db: Session,
+    *,
+    source_types: list[str] | None = None,
+    limit: int = 5000,
+) -> list[RagVectorDocument]:
+    stmt = select(RagVectorDocument).order_by(RagVectorDocument.updated_at.desc()).limit(limit)
+    if source_types:
+        stmt = stmt.where(RagVectorDocument.source_type.in_(source_types))
+    return list(db.scalars(stmt))
 
 
 def _normalize_text(value: str | None) -> str:

@@ -6,7 +6,7 @@ from uuid import uuid4
 from app.db import repo
 from app.db.session import SessionLocal
 from app.runtime import EXPORT_DIR, POLICY_DIR, UPLOAD_DIR, init_runtime
-from app.services import exporter, parser, task_runner
+from app.services import exporter, learning, parser, rag_ingest, task_runner
 
 
 def _save_uploaded_bytes(filename: str, content: bytes, folder: Path) -> Path:
@@ -25,13 +25,19 @@ def upload_policy_pdf(filename: str, content: bytes):
 
     db = SessionLocal()
     try:
-        return repo.create_policy_document(
+        policy = repo.create_policy_document(
             db=db,
             name=filename,
             stored_path=str(stored_path),
             content_hash=content_hash,
             raw_text=raw_text,
         )
+        try:
+            rag_ingest.sync_policy_document(policy)
+        except Exception:
+            # Keep policy upload available even if vector ingestion is temporarily unavailable.
+            pass
+        return policy
     finally:
         db.close()
 
@@ -108,6 +114,23 @@ def list_policies(limit: int = 200):
         db.close()
 
 
+def rebuild_policy_rag_index(limit: int = 500) -> int:
+    init_runtime()
+    db = SessionLocal()
+    try:
+        policies = repo.list_policy_documents(db, limit=limit)
+    finally:
+        db.close()
+
+    indexed = 0
+    for policy in policies:
+        try:
+            indexed += rag_ingest.sync_policy_document(policy)
+        except Exception:
+            continue
+    return indexed
+
+
 def delete_policy(policy_id: int) -> bool:
     init_runtime()
     db = SessionLocal()
@@ -131,7 +154,13 @@ def apply_corrections(task_id: str, corrections: dict):
         task = repo.get_task(db, task_id)
         if task is None:
             raise ValueError(f"Task not found: {task_id}")
-        return repo.apply_corrections(db, task, corrections)
+        updated_task = repo.apply_corrections(db, task, corrections)
+        try:
+            learning.learn_from_material_task(updated_task)
+        except Exception:
+            # Learning should not block correction save.
+            pass
+        return updated_task
     finally:
         db.close()
 
