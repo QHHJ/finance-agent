@@ -103,8 +103,12 @@ def _build_material_sheet(workbook: Workbook, extracted_data: dict[str, Any], fi
     sheet = workbook.active
     sheet.title = "材料费入库明细"
 
-    invoice_number = extracted_data.get("invoice_number") or ""
-    seller = extracted_data.get("seller") or ""
+    invoice_number = _cell_value(extracted_data.get("invoice_number") or "")
+    seller_raw = extracted_data.get("seller") or ""
+    if isinstance(seller_raw, dict):
+        seller = str(seller_raw.get("name") or seller_raw.get("seller_name") or _cell_value(seller_raw))
+    else:
+        seller = _cell_value(seller_raw)
 
     sheet.append(["发票号码", invoice_number])
     sheet.append(["销售方名称", seller])
@@ -135,6 +139,51 @@ def _build_material_sheet(workbook: Workbook, extracted_data: dict[str, Any], fi
 
     sheet.append([])
     sheet.append(["合计总价（含税）", f"{final_total:.2f}" if final_total is not None else ""])
+
+    review_items = extracted_data.get("low_confidence_review")
+    if isinstance(review_items, list) and review_items:
+        review_sheet = workbook.create_sheet("人工复核区")
+        review_sheet.append(
+            [
+                "行号",
+                "项目名称",
+                "规格型号",
+                "建议项目名称",
+                "建议规格型号",
+                "置信度",
+                "风险类型",
+                "原因",
+            ]
+        )
+        for item in review_items:
+            if not isinstance(item, dict):
+                continue
+            risk_types = item.get("risk_types")
+            if isinstance(risk_types, list):
+                risk_text = "、".join(str(x) for x in risk_types if str(x).strip())
+            else:
+                risk_text = _cell_value(risk_types)
+            confidence = item.get("confidence")
+            confidence_text = ""
+            if confidence not in (None, ""):
+                conf_value = _safe_float(confidence)
+                if conf_value is not None:
+                    confidence_text = f"{conf_value:.2%}" if conf_value <= 1 else f"{conf_value:.2f}"
+                else:
+                    confidence_text = _cell_value(confidence)
+
+            review_sheet.append(
+                [
+                    _cell_value(item.get("row_no")),
+                    _cell_value(item.get("item_name")),
+                    _cell_value(item.get("spec")),
+                    _cell_value(item.get("suggested_item_name")),
+                    _cell_value(item.get("suggested_spec")),
+                    confidence_text,
+                    risk_text,
+                    _cell_value(item.get("reason")),
+                ]
+            )
 
     detail = workbook.create_sheet("系统结果")
     detail.append(["field", "value"])

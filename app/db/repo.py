@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 from collections import Counter
+import json
 from typing import Any
 
 from sqlalchemy import select
@@ -281,11 +282,23 @@ def list_rag_documents(
     return list(db.scalars(stmt))
 
 
-def _normalize_text(value: str | None) -> str:
-    return (value or "").strip().lower()
+def _normalize_text(value: object | None) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, str):
+        return value.strip().lower()
+    if isinstance(value, (list, tuple, set)):
+        parts = [str(item).strip() for item in value if str(item).strip()]
+        return " ".join(parts).lower()
+    if isinstance(value, dict):
+        try:
+            return json.dumps(value, ensure_ascii=False, sort_keys=True).strip().lower()
+        except Exception:
+            return str(value).strip().lower()
+    return str(value).strip().lower()
 
 
-def _is_similar_item(current_item: str | None, historical_item: str | None) -> bool:
+def _is_similar_item(current_item: object | None, historical_item: object | None) -> bool:
     cur = _normalize_text(current_item)
     hist = _normalize_text(historical_item)
     if not cur:

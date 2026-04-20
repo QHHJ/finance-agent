@@ -18,6 +18,8 @@ SPEC_HINT_WORDS = {
     "附图",
     "不锈钢",
     "屏蔽",
+    "超薄",
+    "专用",
     "金属件",
     "中号",
     "纯铜",
@@ -80,6 +82,14 @@ def _env_float(name: str, default: float) -> float:
         return float(raw)
     except ValueError:
         return default
+
+
+def _vl_model() -> str:
+    return os.getenv("OLLAMA_VL_MODEL") or os.getenv("OLLAMA_MODEL", "qwen2.5vl:3b")
+
+
+def _text_model() -> str:
+    return os.getenv("OLLAMA_TEXT_MODEL") or os.getenv("OLLAMA_CHAT_MODEL") or _vl_model()
 
 
 def _normalize_spaces(text: str) -> str:
@@ -201,6 +211,12 @@ def _split_item_name_and_spec(item_name: str, spec: str) -> tuple[str, str]:
                 spec_text = candidate_spec
                 break
 
+        if not spec_text:
+            fallback_name, fallback_spec = _split_name_tail_to_spec(name)
+            if fallback_name and fallback_spec:
+                name = fallback_name
+                spec_text = fallback_spec
+
     return _normalize_item_name(name), spec_text
 
 
@@ -257,8 +273,34 @@ def _split_name_tail_to_spec(text: str) -> tuple[str, str]:
     for word in sorted(SPEC_HINT_WORDS, key=len, reverse=True):
         if value.endswith(word) and len(value) > len(word) + 1:
             name = value[: -len(word)].rstrip(" -_/，,;；:：")
-            if name:
+            if not name:
+                continue
+            # Avoid over-splitting common nouns (e.g. "高压绝缘子") unless suffix is repeated
+            # or explicitly separated.
+            repeated_suffix = len(re.findall(re.escape(word), value)) >= 2
+            has_separator = bool(re.search(rf"[\s/_\-()（）\[\]【】]{re.escape(word)}$", value))
+            if repeated_suffix or has_separator:
                 return _refine_name_spec_boundary(name, word)
+
+    # e.g. "*电子元件*OpenMV测距扩展板OpenMV专用" -> spec = "OpenMV专用"
+    dedicated_suffix = re.match(r"^(?P<name>.*?)(?P<spec>[A-Za-z][A-Za-z0-9+\-_.]{1,20}专用)$", value)
+    if dedicated_suffix:
+        name = _normalize_spaces(dedicated_suffix.group("name")).rstrip(" -_/，,;；:：")
+        spec = _normalize_spec_text(dedicated_suffix.group("spec"))
+        if name and spec:
+            return _refine_name_spec_boundary(name, spec)
+
+    # e.g. "野火AD7192ADC模块" -> item_name="野火ADC模块", spec="AD7192"
+    embedded_code = re.match(
+        r"^(?P<name>.*?)(?P<spec>[A-Za-z]{1,5}\d{2,}[A-Za-z0-9+\-_.]{0,10}?\d)(?P<tail>ADC模块|DAC模块|模块|开发板|板|芯片)$",
+        value,
+    )
+    if embedded_code:
+        left = _normalize_spaces(embedded_code.group("name")).rstrip(" -_/，,;；:：")
+        code = _normalize_spec_text(embedded_code.group("spec"))
+        tail = _normalize_spaces(embedded_code.group("tail"))
+        if left and code:
+            return _refine_name_spec_boundary(f"{left}{tail}", code)
 
     digit_split = re.match(r"^(?P<name>.*?)(?P<spec>(?:M\d.*|\d.*|[A-Za-z]{2,}\d*[A-Za-z0-9\-_.]*))$", value)
     if digit_split:
@@ -1080,7 +1122,7 @@ def _extract_line_items_from_llm_payload(parsed: dict[str, Any]) -> list[dict[st
 
 def _extract_chunk_with_ollama_text(chunk: list[dict[str, str]]) -> list[dict[str, str]]:
     base_url = os.getenv("OLLAMA_BASE_URL", "http://127.0.0.1:11434").rstrip("/")
-    model = os.getenv("OLLAMA_MODEL", "qwen2.5vl:3b")
+    model = _text_model()
     timeout = _env_int("LONG_MODE_CHUNK_TIMEOUT", 90)
     request_timeout = (10, timeout)
 
@@ -1359,23 +1401,32 @@ def _merge_fields(rule_fields: dict[str, object], llm_fields: dict[str, object])
     return _reconcile_extracted_fields(merged)
 
 
-def _extract_with_ollama_vl(raw_text: str, pdf_path: str | Path) -> dict[str, object]:
+def _extract_with_ollama_vl_images(
+    raw_text: str,
+    images: list[str],
+    page_hint: str | None = None,
+    timeout_override: int | None = None,
+) -> dict[str, object]:
     base_url = os.getenv("OLLAMA_BASE_URL", "http://127.0.0.1:11434").rstrip("/")
-    model = os.getenv("OLLAMA_MODEL", "qwen2.5vl:3b")
-    timeout = int(os.getenv("OLLAMA_TIMEOUT", "180"))
-    max_pages = int(os.getenv("OLLAMA_MAX_PAGES", "1"))
-    render_scale = float(os.getenv("OLLAMA_RENDER_SCALE", "1.2"))
+    model = _vl_model()
+    timeout = timeout_override if timeout_override is not None else int(os.getenv("OLLAMA_TIMEOUT", "180"))
 
     request_timeout = (10, timeout)
-    images = _render_pdf_pages_to_base64_images(pdf_path, max_pages=max_pages, render_scale=render_scale)
     if not images:
         raise RuntimeError("No image rendered from PDF.")
 
+    page_scope = (
+        f"页面范围说明：{page_hint}\n"
+        if page_hint
+        else "页面范围说明：如输入包含多页，请抽取全部页面中的有效明细。\n"
+    )
     prompt = (
         "你是财务票据抽取助手。请根据发票图片输出严格 JSON，不要输出其他文本。\n"
         "必须包含字段：invoice_number, invoice_date, amount, tax_amount, seller, buyer, bill_type, item_content, line_items。\n"
         "line_items 是数组，每项包含：item_name, spec, quantity, unit, amount_no_tax, tax_amount, unit_price, line_total_with_tax。\n"
         "注意：发票“金额”通常是不含税金额，line_total_with_tax 必须是 含税金额（= amount_no_tax + tax_amount）。\n"
+        "若当前页无法识别某字段，请填 null 或空数组，不能臆造。\n"
+        f"{page_scope}"
         "如果某字段无法识别，请填 null 或空数组。金额统一保留两位小数。\n"
         f"OCR参考文本：{raw_text[:1500]}"
     )
@@ -1421,6 +1472,13 @@ def _extract_with_ollama_vl(raw_text: str, pdf_path: str | Path) -> dict[str, ob
         errors.append(f"/api/chat request failed: {exc}")
 
     raise RuntimeError("; ".join(errors))
+
+
+def _extract_with_ollama_vl(raw_text: str, pdf_path: str | Path) -> dict[str, object]:
+    max_pages = int(os.getenv("OLLAMA_MAX_PAGES", "1"))
+    render_scale = float(os.getenv("OLLAMA_RENDER_SCALE", "1.2"))
+    images = _render_pdf_pages_to_base64_images(pdf_path, max_pages=max_pages, render_scale=render_scale)
+    return _extract_with_ollama_vl_images(raw_text=raw_text, images=images)
 
 
 def extract_invoice_fields(raw_text: str, pdf_path: str | Path | None = None) -> dict[str, object]:

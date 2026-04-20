@@ -54,6 +54,20 @@ def retrieve_material_case_hits(query: str, top_k: int | None = None) -> list[di
     )
 
 
+def retrieve_material_fix_case_hits(query: str, top_k: int | None = None) -> list[dict[str, Any]]:
+    k = top_k or _top_k(4, "RAG_MATERIAL_FIX_CASE_TOP_K")
+    hits = rag_store.query_documents(
+        query=query,
+        source_types=["material_fix_case"],
+        top_k=k,
+        min_score=float(os.getenv("RAG_CASE_MIN_SCORE", "0.16")),
+    )
+    if hits:
+        return hits
+    # Fallback to coarse material cases when row-level fix samples are still sparse.
+    return retrieve_material_case_hits(query=query, top_k=k)
+
+
 def retrieve_travel_case_hits(query: str, top_k: int | None = None) -> list[dict[str, Any]]:
     return rag_store.query_documents(
         query=query,

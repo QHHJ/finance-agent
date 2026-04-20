@@ -15,7 +15,7 @@ import streamlit as st
 from pypdf import PdfReader
 
 from app.runtime import init_runtime
-from app.services import extractor, learning, local_runner, rag_retriever
+from app.services import extractor, learning, local_runner, material_fix_agent, rag_retriever
 
 LINE_ITEM_FIELDS = ["item_name", "spec", "quantity", "unit", "line_total_with_tax"]
 UPLOAD_TYPES = ["pdf", "png", "jpg", "jpeg", "webp"]
@@ -147,6 +147,82 @@ def _extract_pdf_text_from_bytes(file_bytes: bytes) -> str:
 
 def _env_flag_true(name: str) -> bool:
     return str(os.getenv(name, "")).strip().lower() in TRUE_VALUES
+
+
+def _vl_model() -> str:
+    return os.getenv("OLLAMA_VL_MODEL") or os.getenv("OLLAMA_MODEL", "qwen2.5vl:3b")
+
+
+def _text_model() -> str:
+    return os.getenv("OLLAMA_TEXT_MODEL") or os.getenv("OLLAMA_CHAT_MODEL") or _vl_model()
+
+
+def _chat_model() -> str:
+    return os.getenv("OLLAMA_CHAT_MODEL") or _text_model()
+
+
+def _current_model_config() -> dict[str, Any]:
+    base_url = os.getenv("OLLAMA_BASE_URL", "http://127.0.0.1:11434").rstrip("/")
+    vl_model = _vl_model()
+    text_model = _text_model()
+    chat_model = _chat_model()
+    embed_model = os.getenv("OLLAMA_EMBED_MODEL", "nomic-embed-text")
+    return {
+        "use_ollama_vl": _env_flag_true("USE_OLLAMA_VL"),
+        "base_url": base_url,
+        "vl_model": vl_model,
+        "text_model": text_model,
+        "chat_model": chat_model,
+        "embed_model": embed_model,
+    }
+
+
+def _get_ollama_runtime_rows(base_url: str) -> tuple[list[dict[str, Any]], str | None]:
+    try:
+        resp = requests.get(f"{base_url}/api/ps", timeout=(4, 12))
+        resp.raise_for_status()
+        payload = resp.json()
+    except Exception as exc:
+        return [], str(exc)
+
+    rows: list[dict[str, Any]] = []
+    models = payload.get("models") if isinstance(payload, dict) else None
+    if not isinstance(models, list):
+        return rows, None
+
+    for item in models:
+        if not isinstance(item, dict):
+            continue
+        rows.append(
+            {
+                "模型": str(item.get("name") or ""),
+                "处理器占用": str(item.get("details", {}).get("processor") or item.get("processor") or ""),
+                "上下文": str(item.get("details", {}).get("context_length") or item.get("context") or ""),
+                "驻留到": str(item.get("expires_at") or item.get("until") or ""),
+                "大小": str(item.get("size") or ""),
+            }
+        )
+    return rows, None
+
+
+def _render_model_runtime_panel() -> None:
+    cfg = _current_model_config()
+    with st.expander("当前模型与运行状态", expanded=False):
+        st.markdown(f"- 视觉抽取模型：`{cfg['vl_model']}`")
+        st.markdown(f"- 文本抽取/修复模型：`{cfg['text_model']}`")
+        st.markdown(f"- 对话模型：`{cfg['chat_model']}`")
+        st.markdown(f"- 向量模型：`{cfg['embed_model']}`")
+        st.markdown(f"- Ollama 地址：`{cfg['base_url']}`")
+        st.markdown(f"- 启用视觉抽取：`{cfg['use_ollama_vl']}`")
+
+        rows, err = _get_ollama_runtime_rows(cfg["base_url"])
+        if err:
+            st.caption(f"未能获取运行中模型状态：{err}")
+            return
+        if not rows:
+            st.caption("当前没有模型驻留（或 Ollama 暂无活跃会话）。")
+            return
+        st.dataframe(rows, use_container_width=True, hide_index=True)
 
 
 def _extract_amount_from_filename(file_name: str) -> float | None:
@@ -485,7 +561,7 @@ def _extract_payment_amount_with_ollama(file_bytes: bytes) -> float | None:
         return None
 
     base_url = os.getenv("OLLAMA_BASE_URL", "http://127.0.0.1:11434").rstrip("/")
-    model = os.getenv("OLLAMA_MODEL", "qwen2.5vl:3b")
+    model = _vl_model()
     encoded = base64.b64encode(file_bytes).decode("utf-8")
 
     prompts = [
@@ -546,7 +622,7 @@ def _extract_payment_amount_with_ollama_text(raw_text: str) -> float | None:
         return None
 
     base_url = os.getenv("OLLAMA_BASE_URL", "http://127.0.0.1:11434").rstrip("/")
-    model = os.getenv("OLLAMA_MODEL", "qwen2.5vl:3b")
+    model = _vl_model()
     prompts = [
         (
             "你是财务助手。请从以下支付记录文本中提取“本次支付金额（人民币）”。"
@@ -1389,7 +1465,7 @@ def _classify_travel_doc_with_ollama(
     _ = retry_tag
 
     base_url = os.getenv("OLLAMA_BASE_URL", "http://127.0.0.1:11434").rstrip("/")
-    model = os.getenv("OLLAMA_MODEL", "qwen2.5vl:3b")
+    model = _vl_model()
     rag_context = _build_travel_rag_context(raw_text)
     policy_block = f"\nPolicy snippets:\n{rag_context}\n" if rag_context else ""
     rule_hint_text = rule_hint if rule_hint in TRAVEL_DOC_TYPES else "unknown"
@@ -2197,7 +2273,7 @@ def _generate_travel_agent_reply_llm(
     messages: list[dict[str, Any]],
 ) -> str | None:
     base_url = os.getenv("OLLAMA_BASE_URL", "http://127.0.0.1:11434").rstrip("/")
-    model = os.getenv("OLLAMA_CHAT_MODEL") or os.getenv("OLLAMA_MODEL", "qwen2.5vl:3b")
+    model = _chat_model()
 
     system_prompt = (
         "你是差旅报销Agent。基于给定上下文回答用户问题，禁止编造未提供的信息。"
@@ -2511,7 +2587,7 @@ def _render_travel_conversation_agent() -> dict[str, Any]:
                 "LLM 当前未返回有效结果。请检查本地 Ollama 服务与模型状态：\n"
                 "- `ollama ps` 是否有正在运行模型\n"
                 "- `OLLAMA_BASE_URL` 与端口是否正确\n"
-                "- 可设置 `OLLAMA_CHAT_MODEL` 为稳定文本模型后重试"
+                "- 可设置 `OLLAMA_TEXT_MODEL` / `OLLAMA_CHAT_MODEL` 为稳定文本模型后重试"
             )
         messages.append({"role": "assistant", "content": reply})
         st.rerun()
@@ -2810,7 +2886,13 @@ MATERIAL_AGENT_FIELDS = ["item_name", "spec", "quantity", "unit", "line_total_wi
 def _material_agent_extract_fields(task) -> dict[str, Any]:
     extracted = dict(task.extracted_data or {})
     rows = _normalize_line_items(_to_editor_rows(extracted.get("line_items")))
+    auto_split_enabled = bool(extracted.get("auto_split_enabled", True))
+    if rows and auto_split_enabled:
+        auto_fixed_rows, _ = _material_agent_auto_split_rows(rows)
+        if auto_fixed_rows:
+            rows = auto_fixed_rows
     extracted["line_items"] = rows
+    extracted["auto_split_enabled"] = auto_split_enabled
 
     if not str(extracted.get("item_content") or "").strip() and rows:
         names = [str(row.get("item_name") or "").strip() for row in rows if str(row.get("item_name") or "").strip()]
@@ -2821,6 +2903,16 @@ def _material_agent_extract_fields(task) -> dict[str, Any]:
         total = _line_items_total(rows)
         if total is not None:
             extracted["amount"] = _format_amount(total)
+    review_items = extracted.get("low_confidence_review")
+    if not isinstance(review_items, list):
+        extracted["low_confidence_review"] = []
+    llm_stats = extracted.get("llm_agent_stats")
+    if not isinstance(llm_stats, dict):
+        extracted["llm_agent_stats"] = {}
+    rule_rows = _normalize_line_items(_to_editor_rows(extracted.get("rule_line_items_baseline")))
+    llm_rows = _normalize_line_items(_to_editor_rows(extracted.get("llm_line_items_suggested")))
+    extracted["rule_line_items_baseline"] = rule_rows
+    extracted["llm_line_items_suggested"] = llm_rows
     return extracted
 
 
@@ -2847,6 +2939,11 @@ def _material_agent_build_fields_payload(fields: dict[str, Any]) -> dict[str, An
         "bill_type": str(fields.get("bill_type") or "").strip() or None,
         "item_content": item_content or None,
         "line_items": rows,
+        "low_confidence_review": list(fields.get("low_confidence_review") or []),
+        "llm_agent_stats": dict(fields.get("llm_agent_stats") or {}),
+        "auto_split_enabled": bool(fields.get("auto_split_enabled", True)),
+        "rule_line_items_baseline": _normalize_line_items(_to_editor_rows(fields.get("rule_line_items_baseline"))),
+        "llm_line_items_suggested": _normalize_line_items(_to_editor_rows(fields.get("llm_line_items_suggested"))),
     }
 
 
@@ -2870,22 +2967,62 @@ def _material_agent_quality_hints(fields: dict[str, Any]) -> list[str]:
         hints.append("未识别到明细行，建议用“重新识别”或手工新增行。")
         return hints
 
+    def _compact(text: str) -> str:
+        return re.sub(r"[\s\-_/,，;；:：()（）\[\]【】]+", "", text or "")
+
+    def _suspicious_overlap(name: str, spec: str) -> bool:
+        if not name or not spec:
+            return False
+        name_c = _compact(name)
+        spec_c = _compact(spec)
+        if len(spec_c) < 3:
+            return False
+        # Avoid noisy warning for pure Chinese short descriptors.
+        if re.fullmatch(r"[\u4e00-\u9fff]+", spec_c) and len(spec_c) <= 4:
+            return False
+        if spec_c not in name_c:
+            return False
+        # Only warn on clear duplication: appears as suffix or repeated in name.
+        return name_c.endswith(spec_c) or name_c.count(spec_c) >= 2
+
     amount_value = _safe_float(fields.get("amount"))
     row_total = _line_items_total(rows)
-    if amount_value is not None and row_total is not None and abs(amount_value - row_total) > 0.1:
+    if (
+        amount_value is not None
+        and row_total is not None
+        and abs(amount_value - row_total) > 10
+        and abs(amount_value - row_total) > max(1.0, amount_value * 0.005)
+    ):
         hints.append(f"发票总金额与明细合计不一致：{_format_amount(amount_value)} vs {_format_amount(row_total)}")
+
+    review_items = fields.get("low_confidence_review")
+    if isinstance(review_items, list) and review_items:
+        hints.append(f"存在 {len(review_items)} 条低置信度修复建议，建议人工复核。")
+
+    llm_stats = fields.get("llm_agent_stats")
+    llm_ran = isinstance(llm_stats, dict) and int(llm_stats.get("chunks_total") or 0) > 0
+    if llm_ran:
+        failed = int(llm_stats.get("chunks_failed") or 0)
+        if failed > 0:
+            hints.append(f"LLM分块执行有 {failed} 个分块失败，建议重试“智能修复”。")
+        suspicious = int(llm_stats.get("suspicious_rows") or 0)
+        auto_fixed = int(llm_stats.get("auto_fixed_rows") or 0)
+        review_rows = int(llm_stats.get("review_rows") or 0)
+        if suspicious > 0 and review_rows <= 0 and auto_fixed > 0:
+            hints.append(f"LLM已自动修复 {auto_fixed} 行可疑数据。")
+        return hints
 
     long_stats = fields.get("long_mode_stats")
     if isinstance(long_stats, dict):
         candidate_rows = int(long_stats.get("candidate_rows") or 0)
         final_rows = int(long_stats.get("final_rows") or 0)
-        if candidate_rows > final_rows > 0:
+        if candidate_rows > 0 and final_rows > 0 and (candidate_rows - final_rows) >= 3:
             hints.append(f"长票候选行 {candidate_rows}，最终行 {final_rows}，可能仍有漏项。")
 
     for idx, row in enumerate(rows, start=1):
         name = str(row.get("item_name") or "").strip()
         spec = str(row.get("spec") or "").strip()
-        if spec and name and spec in name and len(spec) >= 3:
+        if _suspicious_overlap(name, spec):
             hints.append(f"第{idx}行项目名称可能混入规格：{name}")
             if len(hints) >= 4:
                 break
@@ -2911,7 +3048,7 @@ def _material_agent_split_name_spec(name: str, spec: str) -> tuple[str, str]:
 
     if not new_spec:
         match = re.search(
-            r"(M\d+(?:[Xx*]\d+(?:\.\d+)?)?|[A-Za-z]{2,}\d[\w\-./]*|\d+(?:\.\d+)?(?:mm|cm|m|kg|g|V|W|A|Hz)|\d+(?:\.\d+)?\s*(?:-|~|～|x|X|[*])\s*\d+(?:\.\d+)?(?:mm|cm|m)?)$",
+            r"(M\d+(?:[Xx*]\d+(?:\.\d+)?)?|[A-Za-z][A-Za-z0-9+\-_.]{1,20}专用|[A-Za-z]{2,}\d[\w\-./]*|\d+(?:\.\d+)?(?:mm|cm|m|kg|g|V|W|A|Hz)|\d+(?:\.\d+)?\s*(?:-|~|～|x|X|[*])\s*\d+(?:\.\d+)?(?:mm|cm|m)|超薄)$",
             new_name,
         )
         if match:
@@ -2950,6 +3087,527 @@ def _material_agent_auto_split_rows(rows: list[dict[str, Any]]) -> tuple[list[di
             }
         )
     return output, changed
+
+
+def _material_agent_run_llm_fix(
+    task,
+    fields: dict[str, Any],
+) -> tuple[bool, str, Any, dict[str, Any]]:
+    rows = _normalize_line_items(_to_editor_rows(fields.get("line_items")))
+    if not rows:
+        return True, "当前无明细可分析。", task, fields
+
+    header_context = {
+        "invoice_number": fields.get("invoice_number"),
+        "invoice_date": fields.get("invoice_date"),
+        "bill_type": fields.get("bill_type"),
+        "item_content": fields.get("item_content"),
+        "seller": fields.get("seller"),
+        "buyer": fields.get("buyer"),
+        "amount": fields.get("amount"),
+    }
+    raw_text = str(getattr(task, "raw_text", "") or "")
+
+    try:
+        result = material_fix_agent.run_llm_row_repair(
+            rows,
+            header_context=header_context,
+            raw_text=raw_text,
+        )
+    except Exception as exc:
+        return True, f"LLM修复执行失败：{exc}", task, fields
+
+    repaired_rows = _normalize_line_items(_to_editor_rows(result.get("rows")))
+    review_items = list(result.get("review_items") or [])
+    llm_stats = dict(result.get("stats") or {})
+    llm_error = str(result.get("llm_error") or "").strip()
+
+    new_fields = dict(fields)
+    new_fields["auto_split_enabled"] = True
+    # Keep first rule extraction snapshot for later "规则 vs LLM" comparison.
+    rule_baseline = _normalize_line_items(_to_editor_rows(fields.get("rule_line_items_baseline")))
+    if rule_baseline:
+        new_fields["rule_line_items_baseline"] = rule_baseline
+    else:
+        new_fields["rule_line_items_baseline"] = list(rows)
+
+    if repaired_rows:
+        new_fields["line_items"] = repaired_rows
+        new_fields["llm_line_items_suggested"] = list(repaired_rows)
+    else:
+        new_fields["llm_line_items_suggested"] = list(rows)
+    fixed_total = _line_items_total(repaired_rows)
+    if fixed_total is not None:
+        new_fields["amount"] = _format_amount(fixed_total)
+    new_fields["low_confidence_review"] = review_items
+    new_fields["llm_agent_stats"] = llm_stats
+    if llm_error:
+        new_fields["llm_error"] = llm_error
+
+    ok, err = _material_agent_apply_updates(task.id, new_fields)
+    if not ok:
+        return True, f"LLM修复结果保存失败：{err}", task, fields
+
+    updated_task = local_runner.get_task(task.id) or task
+    updated_fields = _material_agent_extract_fields(updated_task)
+    summary = (
+        f"LLM可疑行分析完成：疑似 {llm_stats.get('suspicious_rows', 0)} 行，"
+        f"自动修复 {llm_stats.get('auto_fixed_rows', 0)} 行，"
+        f"待人工复核 {len(review_items)} 行。"
+    )
+    if llm_error:
+        summary += f"（部分分块失败：{llm_error[:120]}）"
+    return True, summary, updated_task, updated_fields
+
+
+def _material_review_dialog_state_key(task_id: str) -> str:
+    return f"material_review_dialog_open_{task_id}"
+
+
+def _material_review_editor_key(task_id: str) -> str:
+    return f"material_review_editor_{task_id}"
+
+
+def _material_agent_build_review_compare_rows(fields: dict[str, Any]) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    rows = _normalize_line_items(_to_editor_rows(fields.get("line_items")))
+    review_items = list(fields.get("low_confidence_review") or [])
+
+    left_rows: list[dict[str, Any]] = []
+    right_rows: list[dict[str, Any]] = []
+    for item in review_items:
+        if not isinstance(item, dict):
+            continue
+        try:
+            row_no = int(item.get("row_no") or 0)
+        except (TypeError, ValueError):
+            continue
+        if row_no <= 0:
+            continue
+
+        current = rows[row_no - 1] if row_no <= len(rows) else {}
+        cur_name = str(current.get("item_name") or item.get("item_name") or "").strip()
+        cur_spec = str(current.get("spec") or item.get("spec") or "").strip()
+        cur_quantity = str(current.get("quantity") or "").strip()
+        cur_unit = str(current.get("unit") or "").strip()
+        cur_total = str(current.get("line_total_with_tax") or "").strip()
+
+        sug_name = str(item.get("suggested_item_name") or cur_name).strip()
+        sug_spec = str(item.get("suggested_spec") or cur_spec).strip()
+
+        confidence_raw = item.get("confidence")
+        try:
+            confidence_text = f"{float(confidence_raw) * 100:.1f}%"
+        except (TypeError, ValueError):
+            confidence_text = str(confidence_raw or "")
+        risk_text = "、".join(str(x) for x in (item.get("risk_types") or []) if str(x).strip())
+        reason_text = str(item.get("reason") or "").strip()
+
+        left_rows.append(
+            {
+                "行号": row_no,
+                "项目名称": cur_name,
+                "规格型号": cur_spec,
+                "数量": cur_quantity,
+                "单位": cur_unit,
+                "每项含税总价": cur_total,
+                "置信度": confidence_text,
+                "风险类型": risk_text,
+                "原因": reason_text,
+            }
+        )
+        right_rows.append(
+            {
+                "row_no": row_no,
+                "item_name": sug_name,
+                "spec": sug_spec,
+                "quantity": cur_quantity,
+                "unit": cur_unit,
+                "line_total_with_tax": cur_total,
+                "confidence_text": confidence_text,
+                "risk_types": risk_text,
+                "reason": reason_text,
+            }
+        )
+    return left_rows, right_rows
+
+
+def _material_agent_apply_review_compare_edits(
+    task_id: str,
+    fields: dict[str, Any],
+    edited_rows: list[dict[str, Any]],
+) -> tuple[bool, str]:
+    base_rows = _normalize_line_items(_to_editor_rows(fields.get("line_items")))
+    if not base_rows:
+        return False, "当前主表无可更新明细。"
+
+    changed = 0
+    for row in edited_rows:
+        if not isinstance(row, dict):
+            continue
+        try:
+            row_no = int(row.get("row_no") or 0)
+        except (TypeError, ValueError):
+            continue
+        if row_no <= 0 or row_no > len(base_rows):
+            continue
+        idx = row_no - 1
+        current = dict(base_rows[idx])
+
+        next_total = _format_amount(_safe_float(row.get("line_total_with_tax")))
+        if not next_total:
+            next_total = current.get("line_total_with_tax", "")
+
+        candidate = {
+            "item_name": str(row.get("item_name") or "").strip() or current.get("item_name", ""),
+            "spec": str(row.get("spec") or "").strip(),
+            "quantity": _normalize_quantity(row.get("quantity")),
+            "unit": str(row.get("unit") or "").strip(),
+            "line_total_with_tax": next_total,
+        }
+        if candidate != current:
+            base_rows[idx] = candidate
+            changed += 1
+
+    if changed <= 0:
+        # Keep explicit feedback so user sees button click has been handled.
+        return False, "已执行应用，但检测到右侧与主表无差异（或当前单元格未提交修改）。"
+
+    new_fields = dict(fields)
+    new_fields["auto_split_enabled"] = False
+    new_fields["line_items"] = base_rows
+    total = _line_items_total(base_rows)
+    if total is not None:
+        new_fields["amount"] = _format_amount(total)
+    # 用户在复核弹窗内确认后，清空低置信度队列。
+    new_fields["low_confidence_review"] = []
+
+    ok, err = _material_agent_apply_updates(task_id, new_fields)
+    if not ok:
+        return False, err or "保存失败。"
+    return True, f"已应用复核修改 {changed} 行，并写入学习案例。"
+
+
+@st.dialog("质量风险复核（左原始 / 右LLM建议）", width="large")
+def _render_material_review_dialog(task_id: str) -> None:
+    task = local_runner.get_task(task_id)
+    if task is None:
+        st.error("任务不存在，无法复核。")
+        return
+
+    fields = _material_agent_extract_fields(task)
+    left_rows, right_rows = _material_agent_build_review_compare_rows(fields)
+    if not right_rows:
+        st.info("当前没有可复核的低置信度行。")
+        if st.button("关闭", key=f"material_review_close_empty_{task_id}", use_container_width=True):
+            st.session_state[_material_review_dialog_state_key(task_id)] = False
+            st.rerun()
+        return
+
+    st.caption("左侧是当前主表中的风险行，右侧是 LLM+案例RAG 建议。可直接改右侧后应用。")
+    st.caption("也可关闭弹窗后在聊天区说：`第N行项目名称改为... 规格改为...`。")
+    c1, c2 = st.columns(2)
+    with c1:
+        st.markdown("**风险原始表**")
+        st.dataframe(left_rows, use_container_width=True, hide_index=True)
+    with c2:
+        st.markdown("**LLM建议表（可编辑）**")
+        edited = st.data_editor(
+            right_rows,
+            use_container_width=True,
+            hide_index=True,
+            key=_material_review_editor_key(task_id),
+            column_config={
+                "row_no": st.column_config.NumberColumn("行号", disabled=True, width="small"),
+                "item_name": st.column_config.TextColumn("项目名称(建议)"),
+                "spec": st.column_config.TextColumn("规格型号(建议)"),
+                "quantity": st.column_config.TextColumn("数量"),
+                "unit": st.column_config.TextColumn("单位"),
+                "line_total_with_tax": st.column_config.TextColumn("每项含税总价"),
+                "confidence_text": st.column_config.TextColumn("置信度", disabled=True),
+                "risk_types": st.column_config.TextColumn("风险类型", disabled=True),
+                "reason": st.column_config.TextColumn("原因", disabled=True),
+            },
+        )
+        edited_rows = _to_editor_rows(edited)
+
+    b1, b2, b3 = st.columns(3)
+    if b1.button("应用右侧到主表并标记已复核", key=f"material_review_apply_{task_id}", use_container_width=True):
+        ok, msg = _material_agent_apply_review_compare_edits(task_id, fields, edited_rows)
+        if ok:
+            st.session_state[_material_review_dialog_state_key(task_id)] = False
+            st.success(msg)
+            st.rerun()
+        else:
+            st.error(msg)
+
+    if b2.button("仅标记已复核（不改动）", key=f"material_review_mark_only_{task_id}", use_container_width=True):
+        new_fields = dict(fields)
+        new_fields["low_confidence_review"] = []
+        ok, err = _material_agent_apply_updates(task_id, new_fields)
+        if ok:
+            st.session_state[_material_review_dialog_state_key(task_id)] = False
+            st.success("已清空复核队列。")
+            st.rerun()
+        else:
+            st.error(f"保存失败：{err}")
+
+    if b3.button("关闭弹窗", key=f"material_review_close_{task_id}", use_container_width=True):
+        st.session_state[_material_review_dialog_state_key(task_id)] = False
+        st.rerun()
+
+
+def _material_rule_llm_compare_dialog_state_key(task_id: str) -> str:
+    return f"material_rule_llm_compare_open_{task_id}"
+
+
+def _material_rule_llm_compare_editor_key(task_id: str) -> str:
+    return f"material_rule_llm_compare_editor_{task_id}"
+
+
+def _material_agent_merge_editor_delta(
+    task_id: str,
+    rows: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """
+    Streamlit data_editor may not always reflect an in-focus cell change in the returned table
+    at the click moment. Merge session-state delta as a safety net (especially for clear-to-empty).
+    """
+    key = _material_rule_llm_compare_editor_key(task_id)
+    state = st.session_state.get(key)
+    if isinstance(state, list):
+        full_rows = _to_editor_rows(state)
+        if full_rows:
+            rows = full_rows
+    if not isinstance(state, dict):
+        return rows
+
+    full_rows = _to_editor_rows(state.get("data"))
+    if full_rows:
+        rows = full_rows
+
+    edited_rows = state.get("edited_rows")
+    if not isinstance(edited_rows, dict):
+        return rows
+
+    output = [dict(row) for row in rows]
+    allowed_fields = {"item_name", "spec", "quantity", "unit", "line_total_with_tax"}
+    ordered_fields = ["row_no", "item_name", "spec", "quantity", "unit", "line_total_with_tax"]
+    visible_fields = list(output[0].keys()) if output else ordered_fields
+    for row_idx_raw, change in edited_rows.items():
+        try:
+            row_idx = int(row_idx_raw)
+        except (TypeError, ValueError):
+            continue
+        if row_idx < 0:
+            continue
+        while row_idx >= len(output):
+            output.append(
+                {
+                    "row_no": len(output) + 1,
+                    "item_name": "",
+                    "spec": "",
+                    "quantity": "",
+                    "unit": "",
+                    "line_total_with_tax": "",
+                }
+            )
+        if not isinstance(change, dict):
+            continue
+        for field, value in change.items():
+            normalized_field = field
+            if normalized_field not in allowed_fields:
+                candidates: list[str] = []
+                try:
+                    col_idx = int(str(field))
+                except (TypeError, ValueError):
+                    col_idx = -1
+                if 0 <= col_idx < len(visible_fields):
+                    candidates.append(str(visible_fields[col_idx]))
+                if 0 <= (col_idx - 1) < len(visible_fields):
+                    candidates.append(str(visible_fields[col_idx - 1]))
+                if 0 <= col_idx < len(ordered_fields):
+                    candidates.append(ordered_fields[col_idx])
+                if 0 <= (col_idx - 1) < len(ordered_fields):
+                    candidates.append(ordered_fields[col_idx - 1])
+                for candidate in candidates:
+                    if candidate in allowed_fields:
+                        normalized_field = candidate
+                        break
+            if normalized_field not in allowed_fields:
+                continue
+            output[row_idx][normalized_field] = "" if value in (None, "") else str(value).strip()
+    return output
+
+
+def _material_agent_get_rule_llm_compare_rows(
+    task_id: str,
+    edited_value: Any,
+    fallback_rows: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    key = _material_rule_llm_compare_editor_key(task_id)
+    state = st.session_state.get(key)
+
+    rows = _to_editor_rows(edited_value)
+    if not rows:
+        rows = _to_editor_rows(state)
+    if not rows and isinstance(state, dict):
+        rows = _to_editor_rows(state.get("data"))
+    if not rows:
+        rows = _to_editor_rows(fallback_rows)
+    return _material_agent_merge_editor_delta(task_id, rows)
+
+
+def _material_agent_build_rule_llm_compare_rows(fields: dict[str, Any]) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    rule_rows = _normalize_line_items(_to_editor_rows(fields.get("rule_line_items_baseline")))
+    llm_rows = _normalize_line_items(_to_editor_rows(fields.get("llm_line_items_suggested")))
+    if not llm_rows:
+        llm_rows = _normalize_line_items(_to_editor_rows(fields.get("line_items")))
+
+    total = max(len(rule_rows), len(llm_rows))
+    left_rows: list[dict[str, Any]] = []
+    right_rows: list[dict[str, Any]] = []
+    for idx in range(total):
+        row_no = idx + 1
+        rule = rule_rows[idx] if idx < len(rule_rows) else {}
+        llm = llm_rows[idx] if idx < len(llm_rows) else rule
+
+        left_rows.append(
+            {
+                "行号": row_no,
+                "项目名称": str(rule.get("item_name") or ""),
+                "规格型号": str(rule.get("spec") or ""),
+                "数量": str(rule.get("quantity") or ""),
+                "单位": str(rule.get("unit") or ""),
+                "每项含税总价": str(rule.get("line_total_with_tax") or ""),
+            }
+        )
+        right_rows.append(
+            {
+                "row_no": row_no,
+                "item_name": str(llm.get("item_name") or ""),
+                "spec": str(llm.get("spec") or ""),
+                "quantity": str(llm.get("quantity") or ""),
+                "unit": str(llm.get("unit") or ""),
+                "line_total_with_tax": str(llm.get("line_total_with_tax") or ""),
+            }
+        )
+    return left_rows, right_rows
+
+
+def _material_agent_rule_llm_diff_count(fields: dict[str, Any]) -> int:
+    rule_rows = _normalize_line_items(_to_editor_rows(fields.get("rule_line_items_baseline")))
+    llm_rows = _normalize_line_items(_to_editor_rows(fields.get("llm_line_items_suggested")))
+    if not llm_rows:
+        llm_rows = _normalize_line_items(_to_editor_rows(fields.get("line_items")))
+    total = max(len(rule_rows), len(llm_rows))
+    changed = 0
+    for idx in range(total):
+        old = rule_rows[idx] if idx < len(rule_rows) else {}
+        new = llm_rows[idx] if idx < len(llm_rows) else {}
+        if old != new:
+            changed += 1
+    return changed
+
+
+def _material_agent_apply_rule_llm_compare_edits(
+    task_id: str,
+    fields: dict[str, Any],
+    edited_rows: list[dict[str, Any]],
+) -> tuple[bool, str]:
+    normalized_rows = _normalize_line_items(_to_editor_rows(edited_rows))
+    if not normalized_rows:
+        return False, "右侧无可应用数据。"
+
+    current_rows = _normalize_line_items(_to_editor_rows(fields.get("line_items")))
+    changed = 0
+    total = max(len(current_rows), len(normalized_rows))
+    for idx in range(total):
+        old = current_rows[idx] if idx < len(current_rows) else {}
+        new = normalized_rows[idx] if idx < len(normalized_rows) else {}
+        if old != new:
+            changed += 1
+    if changed <= 0:
+        return True, "两表当前一致，无需应用。"
+
+    new_fields = dict(fields)
+    new_fields["auto_split_enabled"] = False
+    new_fields["line_items"] = normalized_rows
+    new_fields["llm_line_items_suggested"] = list(normalized_rows)
+    new_fields["low_confidence_review"] = []
+    total_amount = _line_items_total(normalized_rows)
+    if total_amount is not None:
+        new_fields["amount"] = _format_amount(total_amount)
+
+    ok, err = _material_agent_apply_updates(task_id, new_fields)
+    if not ok:
+        return False, err or "保存失败。"
+    return True, f"已应用规则/LLM对比结果，更新 {changed} 行，并写入学习案例。"
+
+
+@st.dialog("智能修复对比（规则识别 vs LLM修复）", width="large")
+def _render_material_rule_llm_compare_dialog(task_id: str) -> None:
+    task = local_runner.get_task(task_id)
+    if task is None:
+        st.error("任务不存在。")
+        return
+
+    fields = _material_agent_extract_fields(task)
+    left_rows, right_rows = _material_agent_build_rule_llm_compare_rows(fields)
+    initial_diff_count = _material_agent_rule_llm_diff_count(fields)
+    if not left_rows and not right_rows:
+        st.info("暂无可对比数据。请先执行一次 LLM 修复。")
+        if st.button("关闭", key=f"material_rule_llm_close_empty_{task_id}", use_container_width=True):
+            st.session_state[_material_rule_llm_compare_dialog_state_key(task_id)] = False
+            st.rerun()
+        return
+
+    st.caption("左侧是规则识别结果（基线），右侧是 LLM+案例修复结果（可编辑）。")
+    st.caption("提示：改完右侧后直接点“应用右侧结果到主表”（form提交可确保当前单元格修改被捕获）。")
+    if initial_diff_count <= 0:
+        st.info("当前规则表与LLM修复表一致，无需处理；可直接关闭弹窗。")
+    with st.form(key=f"material_rule_llm_form_{task_id}", clear_on_submit=False):
+        c1, c2 = st.columns(2)
+        with c1:
+            st.markdown("**规则识别表（基线）**")
+            st.dataframe(left_rows, use_container_width=True, hide_index=True)
+        with c2:
+            st.markdown("**LLM修复表（可编辑）**")
+            edited = st.data_editor(
+                right_rows,
+                use_container_width=True,
+                hide_index=True,
+                key=_material_rule_llm_compare_editor_key(task_id),
+                column_config={
+                    "row_no": st.column_config.NumberColumn("行号", disabled=True, width="small"),
+                    "item_name": st.column_config.TextColumn("项目名称"),
+                    "spec": st.column_config.TextColumn("规格型号"),
+                    "quantity": st.column_config.TextColumn("数量"),
+                    "unit": st.column_config.TextColumn("单位"),
+                    "line_total_with_tax": st.column_config.TextColumn("每项含税总价"),
+                },
+            )
+        apply_submit = st.form_submit_button(
+            "应用右侧结果到主表",
+            use_container_width=True,
+            disabled=initial_diff_count <= 0,
+        )
+
+    if apply_submit:
+        edited_rows = _material_agent_get_rule_llm_compare_rows(task_id, edited, right_rows)
+        ok, msg = _material_agent_apply_rule_llm_compare_edits(task_id, fields, edited_rows)
+        if ok:
+            if "无需应用" in msg:
+                st.info(msg)
+            else:
+                st.session_state[_material_rule_llm_compare_dialog_state_key(task_id)] = False
+                st.success(msg)
+                st.rerun()
+        else:
+            st.error(msg)
+
+    if st.button("关闭", key=f"material_rule_llm_close_{task_id}", use_container_width=True):
+        st.session_state[_material_rule_llm_compare_dialog_state_key(task_id)] = False
+        st.rerun()
 
 
 def _material_agent_parse_chinese_number(token: str) -> int | None:
@@ -3020,18 +3678,22 @@ def _material_agent_extract_row_updates(text: str) -> dict[str, str]:
         "含税总价": "line_total_with_tax",
         "金额": "line_total_with_tax",
     }
-    labels = "|".join(field_map.keys())
     updates: dict[str, str] = {}
+    labels = "|".join(sorted((re.escape(k) for k in field_map.keys()), key=len, reverse=True))
+    op = r"(?:应为|改为|设置为|设为|为|=|:|：)"
+    pattern = re.compile(rf"({labels})\s*{op}\s*", re.IGNORECASE)
+    matches = list(pattern.finditer(str(text or "")))
+    if not matches:
+        return updates
 
-    for alias, target in field_map.items():
-        pattern = (
-            rf"(?:{re.escape(alias)})\s*(?:应为|改为|设置为|设为|为|=|:|：)\s*(.+?)"
-            rf"(?=(?:{labels})\s*(?:应为|改为|设置为|设为|为|=|:|：)|$)"
-        )
-        match = re.search(pattern, text)
-        if not match:
+    for idx, match in enumerate(matches):
+        alias = str(match.group(1) or "")
+        target = field_map.get(alias)
+        if not target:
             continue
-        value = str(match.group(1) or "").strip().strip("。；;，,")
+        start = match.end()
+        end = matches[idx + 1].start() if idx + 1 < len(matches) else len(text)
+        value = str(text[start:end] or "").strip().strip("。；;，,")
         if not value:
             continue
         if target == "line_total_with_tax":
@@ -3048,7 +3710,7 @@ def _material_agent_looks_like_edit_intent(text: str) -> bool:
     source = str(text or "")
     action_hit = any(
         token in source
-        for token in ["改为", "应为", "设置为", "设为", "删除", "新增一行", "添加一行", "分列修复", "重新识别"]
+        for token in ["改为", "应为", "设置为", "设为", "删除", "新增一行", "添加一行", "重新识别"]
     )
     target_hit = any(
         token in source
@@ -3069,6 +3731,426 @@ def _material_agent_looks_like_edit_intent(text: str) -> bool:
     return action_hit and target_hit
 
 
+def _material_agent_has_action_intent(text: str) -> bool:
+    source = str(text or "").strip()
+    if not source:
+        return False
+
+    strong_tokens = [
+        "第", "最后一行", "倒数第", "删除", "新增一行", "添加一行",
+        "改为", "应为", "设置为", "设为", "重新识别", "智能修复",
+        "打开对比", "应用llm修复表", "应用llm结果", "应用对比结果",
+        "撤销上一步", "查看最近变更", "变更记录",
+    ]
+    return any(token in source for token in strong_tokens)
+
+
+def _material_agent_is_smalltalk(text: str) -> bool:
+    source = str(text or "").strip().lower()
+    if not source:
+        return False
+    smalltalk_tokens = {
+        "你好", "您好", "在吗", "在不在", "hi", "hello", "hey",
+        "好的", "ok", "谢谢", "好的谢谢",
+    }
+    if source in smalltalk_tokens:
+        return True
+    # Very short casual utterances should not trigger tool actions.
+    return len(source) <= 4 and any(token in source for token in ["你好", "hi", "ok", "在吗"])
+
+
+def _material_agent_undo_stack_key(task_id: str) -> str:
+    return f"material_agent_undo_stack_{task_id}"
+
+
+def _material_agent_change_log_key(task_id: str) -> str:
+    return f"material_agent_change_log_{task_id}"
+
+
+def _material_agent_snapshot_fields(fields: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "line_items": _normalize_line_items(_to_editor_rows(fields.get("line_items"))),
+        "amount": str(fields.get("amount") or ""),
+        "auto_split_enabled": bool(fields.get("auto_split_enabled", False)),
+        "llm_line_items_suggested": _normalize_line_items(_to_editor_rows(fields.get("llm_line_items_suggested"))),
+        "low_confidence_review": list(fields.get("low_confidence_review") or []),
+    }
+
+
+def _material_agent_push_undo_snapshot(task_id: str, fields: dict[str, Any]) -> None:
+    key = _material_agent_undo_stack_key(task_id)
+    stack = st.session_state.setdefault(key, [])
+    if not isinstance(stack, list):
+        stack = []
+    stack.append(_material_agent_snapshot_fields(fields))
+    if len(stack) > 20:
+        stack = stack[-20:]
+    st.session_state[key] = stack
+
+
+def _material_agent_pop_undo_snapshot(task_id: str) -> dict[str, Any] | None:
+    key = _material_agent_undo_stack_key(task_id)
+    stack = st.session_state.get(key)
+    if not isinstance(stack, list) or not stack:
+        return None
+    snapshot = stack.pop()
+    st.session_state[key] = stack
+    return snapshot if isinstance(snapshot, dict) else None
+
+
+def _material_agent_record_change(task_id: str, action: str, summary_lines: list[str], user_text: str) -> None:
+    key = _material_agent_change_log_key(task_id)
+    logs = st.session_state.setdefault(key, [])
+    if not isinstance(logs, list):
+        logs = []
+    logs.append(
+        {
+            "time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "action": action,
+            "summary_lines": list(summary_lines or []),
+            "user_text": str(user_text or "").strip(),
+        }
+    )
+    if len(logs) > 30:
+        logs = logs[-30:]
+    st.session_state[key] = logs
+
+
+def _material_agent_recent_changes_text(task_id: str, limit: int = 5) -> str:
+    logs = st.session_state.get(_material_agent_change_log_key(task_id))
+    if not isinstance(logs, list) or not logs:
+        return "当前会话还没有可展示的变更记录。"
+    parts: list[str] = []
+    for item in logs[-max(1, limit):]:
+        if not isinstance(item, dict):
+            continue
+        stamp = str(item.get("time") or "")
+        action = str(item.get("action") or "")
+        lines = list(item.get("summary_lines") or [])
+        if not lines:
+            lines = ["已执行变更。"]
+        parts.append(f"- [{stamp}] {action}：{'; '.join(str(x) for x in lines[:3])}")
+    return "最近变更：\n" + "\n".join(parts)
+
+
+def _material_agent_build_row_diff(old_rows: list[dict[str, Any]], new_rows: list[dict[str, Any]], max_lines: int = 8) -> list[str]:
+    result: list[str] = []
+    total = max(len(old_rows), len(new_rows))
+    for idx in range(total):
+        old = dict(old_rows[idx]) if idx < len(old_rows) else {}
+        new = dict(new_rows[idx]) if idx < len(new_rows) else {}
+        row_no = idx + 1
+        if not old and new:
+            result.append(f"第{row_no}行新增：{new.get('item_name', '')}")
+        elif old and not new:
+            result.append(f"第{row_no}行删除：{old.get('item_name', '')}")
+        else:
+            changed_fields: list[str] = []
+            for field_name, label in [
+                ("item_name", "项目名称"),
+                ("spec", "规格型号"),
+                ("quantity", "数量"),
+                ("unit", "单位"),
+                ("line_total_with_tax", "每项含税总价"),
+            ]:
+                if str(old.get(field_name) or "") != str(new.get(field_name) or ""):
+                    changed_fields.append(label)
+            if changed_fields:
+                result.append(f"第{row_no}行更新：{'、'.join(changed_fields)}")
+        if len(result) >= max_lines:
+            break
+    return result
+
+
+def _material_agent_extract_json_object(text: str) -> dict[str, Any] | None:
+    source = str(text or "").strip()
+    if not source:
+        return None
+    try:
+        payload = json.loads(source)
+        return payload if isinstance(payload, dict) else None
+    except Exception:
+        pass
+
+    match = re.search(r"\{[\s\S]*\}", source)
+    if not match:
+        return None
+    try:
+        payload = json.loads(match.group(0))
+        return payload if isinstance(payload, dict) else None
+    except Exception:
+        return None
+
+
+def _material_agent_action_row_no(action: dict[str, Any], row_count: int) -> int | None:
+    raw = action.get("row_no", action.get("row", action.get("index")))
+    try:
+        row_no = int(raw)
+    except (TypeError, ValueError):
+        row_no = None
+    if row_no is None:
+        row_ref = str(action.get("row_ref") or "").strip()
+        if row_ref:
+            idx = _material_agent_resolve_row_index(row_ref, row_count)
+            if idx is not None:
+                return idx + 1
+        return None
+    if row_no < 1:
+        return None
+    return row_no
+
+
+def _material_agent_normalize_update_fields(raw_fields: Any) -> dict[str, str]:
+    if not isinstance(raw_fields, dict):
+        return {}
+
+    alias_map = {
+        "item_name": "item_name",
+        "项目名称": "item_name",
+        "项目名": "item_name",
+        "name": "item_name",
+        "spec": "spec",
+        "规格": "spec",
+        "规格型号": "spec",
+        "quantity": "quantity",
+        "数量": "quantity",
+        "unit": "unit",
+        "单位": "unit",
+        "line_total_with_tax": "line_total_with_tax",
+        "每项含税总价": "line_total_with_tax",
+        "含税总价": "line_total_with_tax",
+        "金额": "line_total_with_tax",
+    }
+    output: dict[str, str] = {}
+    for key, value in raw_fields.items():
+        target = alias_map.get(str(key).strip())
+        if not target:
+            continue
+        text = "" if value is None else str(value).strip()
+        if target == "line_total_with_tax":
+            text = _format_amount(_safe_float(text))
+        elif target == "quantity":
+            text = _normalize_quantity(text)
+        output[target] = text
+    return output
+
+
+def _material_agent_parse_actions_llm(
+    user_text: str,
+    task,
+    fields: dict[str, Any],
+) -> list[dict[str, Any]]:
+    base_url = os.getenv("OLLAMA_BASE_URL", "http://127.0.0.1:11434").rstrip("/")
+    model = _chat_model()
+    rows = _normalize_line_items(_to_editor_rows(fields.get("line_items")))
+    row_preview = []
+    for idx, row in enumerate(rows[:8], start=1):
+        row_preview.append(
+            {
+                "row_no": idx,
+                "item_name": row.get("item_name"),
+                "spec": row.get("spec"),
+                "quantity": row.get("quantity"),
+                "unit": row.get("unit"),
+                "line_total_with_tax": row.get("line_total_with_tax"),
+            }
+        )
+
+    system_prompt = (
+        "你是材料费表格动作解析器。"
+        "请把用户自然语言转换为可执行JSON，仅输出JSON对象，不要解释。"
+        "JSON格式: {\"actions\":[...],\"reason\":\"...\"}。"
+        "action只允许: update_row, batch_update, delete_row, add_row, reidentify, open_compare, apply_compare, undo_last, show_changes, none。"
+        "字段只允许: item_name,spec,quantity,unit,line_total_with_tax。"
+        "row_no从1开始。"
+    )
+    user_payload = {
+        "task_id": getattr(task, "id", ""),
+        "filename": getattr(task, "original_filename", ""),
+        "row_count": len(rows),
+        "row_preview": row_preview,
+        "user_text": str(user_text or ""),
+    }
+    user_prompt = json.dumps(user_payload, ensure_ascii=False)
+
+    try:
+        payload = {
+            "model": model,
+            "stream": False,
+            "format": "json",
+            "messages": [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt},
+            ],
+            "options": {"temperature": 0.0},
+        }
+        resp = requests.post(f"{base_url}/api/chat", json=payload, timeout=(8, 60))
+        resp.raise_for_status()
+        content = (resp.json().get("message") or {}).get("content", "")
+        data = _material_agent_extract_json_object(content)
+        if isinstance(data, dict):
+            actions = data.get("actions")
+            if isinstance(actions, list):
+                return [item for item in actions if isinstance(item, dict)]
+    except Exception:
+        return []
+    return []
+
+
+def _material_agent_apply_actions_from_llm(
+    user_text: str,
+    task,
+    fields: dict[str, Any],
+) -> tuple[bool, str, Any, dict[str, Any]]:
+    actions = _material_agent_parse_actions_llm(user_text, task, fields)
+    if not actions:
+        return False, "", task, fields
+
+    first_action = str((actions[0] or {}).get("action") or "").strip().lower()
+    if first_action in {"", "none"}:
+        return False, "", task, fields
+
+    rows = _normalize_line_items(_to_editor_rows(fields.get("line_items")))
+    if first_action == "show_changes":
+        return True, _material_agent_recent_changes_text(task.id), task, fields
+
+    if first_action == "undo_last":
+        snapshot = _material_agent_pop_undo_snapshot(task.id)
+        if not snapshot:
+            return True, "没有可撤销的最近修改。", task, fields
+        new_fields = dict(fields)
+        new_fields["auto_split_enabled"] = False
+        new_fields["line_items"] = _normalize_line_items(_to_editor_rows(snapshot.get("line_items")))
+        new_fields["amount"] = str(snapshot.get("amount") or "")
+        new_fields["llm_line_items_suggested"] = _normalize_line_items(_to_editor_rows(snapshot.get("llm_line_items_suggested")))
+        new_fields["low_confidence_review"] = list(snapshot.get("low_confidence_review") or [])
+        ok, err = _material_agent_apply_updates(task.id, new_fields)
+        if not ok:
+            return True, f"撤销失败：{err}", task, fields
+        updated_task = local_runner.get_task(task.id) or task
+        updated_fields = _material_agent_extract_fields(updated_task)
+        _material_agent_record_change(task.id, "undo_last", ["已回滚到上一步。"], user_text)
+        return True, "已撤销上一步修改。", updated_task, updated_fields
+
+    if first_action == "open_compare":
+        st.session_state[_material_rule_llm_compare_dialog_state_key(task.id)] = True
+        return True, "已打开“智能修复对比（规则 vs LLM）”弹窗。", task, fields
+
+    if first_action == "apply_compare":
+        llm_rows = _normalize_line_items(_to_editor_rows(fields.get("llm_line_items_suggested")))
+        if not llm_rows:
+            return True, "当前没有可应用的LLM修复表，请先点“智能修复对比（规则 vs LLM）”生成。", task, fields
+        _material_agent_push_undo_snapshot(task.id, fields)
+        new_fields = dict(fields)
+        new_fields["auto_split_enabled"] = False
+        new_fields["line_items"] = llm_rows
+        new_fields["amount"] = _format_amount(_line_items_total(llm_rows))
+        ok, err = _material_agent_apply_updates(task.id, new_fields)
+        if not ok:
+            return True, f"应用LLM修复表失败：{err}", task, fields
+        updated_task = local_runner.get_task(task.id) or task
+        updated_fields = _material_agent_extract_fields(updated_task)
+        diff_lines = _material_agent_build_row_diff(rows, llm_rows)
+        _material_agent_record_change(task.id, "apply_compare", diff_lines or ["已应用LLM修复表。"], user_text)
+        return True, "已将LLM修复表应用到主表。", updated_task, updated_fields
+
+    if first_action == "reidentify":
+        try:
+            local_runner.process_task(task.id)
+            local_runner.export_task(task.id, export_format="both")
+            updated_task = local_runner.get_task(task.id) or task
+            updated_fields = _material_agent_extract_fields(updated_task)
+            line_count = len(_normalize_line_items(_to_editor_rows(updated_fields.get("line_items"))))
+            _material_agent_record_change(task.id, "reidentify", [f"重新识别后共 {line_count} 行。"], user_text)
+            return True, f"已重新识别，当前识别到明细 {line_count} 行。", updated_task, updated_fields
+        except Exception as exc:
+            return True, f"重新识别失败：{exc}", task, fields
+
+    # Row-level actions (update/delete/add/batch_update)
+    working_rows = [dict(row) for row in rows]
+    summaries: list[str] = []
+    for action in actions:
+        act = str(action.get("action") or "").strip().lower()
+        if act not in {"update_row", "delete_row", "add_row", "batch_update"}:
+            continue
+
+        if act == "batch_update":
+            updates = action.get("updates")
+            if not isinstance(updates, list):
+                continue
+            for item in updates:
+                if not isinstance(item, dict):
+                    continue
+                row_no = _material_agent_action_row_no(item, len(working_rows))
+                if row_no is None or row_no < 1 or row_no > len(working_rows):
+                    continue
+                fields_patch = _material_agent_normalize_update_fields(item.get("fields") or {})
+                if not fields_patch:
+                    continue
+                working_rows[row_no - 1].update(fields_patch)
+                summaries.append(f"第{row_no}行更新：{','.join(fields_patch.keys())}")
+            continue
+
+        if act == "update_row":
+            row_no = _material_agent_action_row_no(action, len(working_rows))
+            if row_no is None or row_no < 1 or row_no > len(working_rows):
+                continue
+            fields_patch = _material_agent_normalize_update_fields(action.get("fields") or {})
+            if not fields_patch:
+                continue
+            working_rows[row_no - 1].update(fields_patch)
+            summaries.append(f"第{row_no}行更新：{','.join(fields_patch.keys())}")
+            continue
+
+        if act == "delete_row":
+            row_no = _material_agent_action_row_no(action, len(working_rows))
+            if row_no is None or row_no < 1 or row_no > len(working_rows):
+                continue
+            removed = dict(working_rows[row_no - 1])
+            del working_rows[row_no - 1]
+            summaries.append(f"删除第{row_no}行：{removed.get('item_name', '')}")
+            continue
+
+        if act == "add_row":
+            fields_patch = _material_agent_normalize_update_fields(action.get("fields") or {})
+            if not fields_patch.get("item_name"):
+                continue
+            payload = {
+                "item_name": fields_patch.get("item_name", ""),
+                "spec": fields_patch.get("spec", ""),
+                "quantity": fields_patch.get("quantity", ""),
+                "unit": fields_patch.get("unit", ""),
+                "line_total_with_tax": fields_patch.get("line_total_with_tax", ""),
+            }
+            working_rows.append(payload)
+            summaries.append(f"新增第{len(working_rows)}行：{payload.get('item_name', '')}")
+
+    new_rows = _normalize_line_items(working_rows)
+    if not new_rows:
+        return True, "未识别到可执行的修改动作。你可以说：第3行数量改为20。", task, fields
+
+    if new_rows == rows:
+        return True, "没有检测到实际变更（可能行号或字段未命中）。", task, fields
+
+    _material_agent_push_undo_snapshot(task.id, fields)
+    new_fields = dict(fields)
+    new_fields["auto_split_enabled"] = False
+    new_fields["line_items"] = new_rows
+    total = _line_items_total(new_rows)
+    if total is not None:
+        new_fields["amount"] = _format_amount(total)
+    ok, err = _material_agent_apply_updates(task.id, new_fields)
+    if not ok:
+        return True, f"执行失败：{err}", task, fields
+
+    updated_task = local_runner.get_task(task.id) or task
+    updated_fields = _material_agent_extract_fields(updated_task)
+    diff_lines = _material_agent_build_row_diff(rows, new_rows)
+    _material_agent_record_change(task.id, first_action, diff_lines or summaries or ["已应用修改。"], user_text)
+    summary_text = "；".join((diff_lines or summaries)[:4]) if (diff_lines or summaries) else "已应用修改。"
+    return True, f"已执行：{summary_text}", updated_task, updated_fields
+
+
 def _material_agent_apply_chat_command(
     user_text: str,
     task,
@@ -3077,6 +4159,59 @@ def _material_agent_apply_chat_command(
     text = str(user_text or "").strip()
     if not text:
         return True, "请给我一个明确指令，例如：`第3行规格改为M20X1.5`。", task, fields
+
+    # Casual chat should not be interpreted as executable actions.
+    if _material_agent_is_smalltalk(text):
+        return True, "你好，我在。你可以直接说：`第N行...改为...`、`删除第N行`、`新增一行...`。", task, fields
+
+    action_intent = _material_agent_has_action_intent(text)
+    if action_intent:
+        llm_handled, llm_reply, llm_task, llm_fields = _material_agent_apply_actions_from_llm(text, task, fields)
+        if llm_handled:
+            return llm_handled, llm_reply, llm_task, llm_fields
+
+    if any(token in text for token in ["查看最近变更", "最近变更", "变更记录"]):
+        return True, _material_agent_recent_changes_text(task.id), task, fields
+
+    if any(token in text for token in ["撤销上一步", "撤销", "回滚"]):
+        snapshot = _material_agent_pop_undo_snapshot(task.id)
+        if not snapshot:
+            return True, "没有可撤销的最近修改。", task, fields
+        new_fields = dict(fields)
+        new_fields["auto_split_enabled"] = False
+        new_fields["line_items"] = _normalize_line_items(_to_editor_rows(snapshot.get("line_items")))
+        new_fields["amount"] = str(snapshot.get("amount") or "")
+        new_fields["llm_line_items_suggested"] = _normalize_line_items(_to_editor_rows(snapshot.get("llm_line_items_suggested")))
+        new_fields["low_confidence_review"] = list(snapshot.get("low_confidence_review") or [])
+        ok, err = _material_agent_apply_updates(task.id, new_fields)
+        if not ok:
+            return True, f"撤销失败：{err}", task, fields
+        updated_task = local_runner.get_task(task.id) or task
+        updated_fields = _material_agent_extract_fields(updated_task)
+        _material_agent_record_change(task.id, "undo_last", ["已回滚到上一步。"], text)
+        return True, "已撤销上一步修改。", updated_task, updated_fields
+
+    if any(token in text for token in ["打开对比", "智能修复对比", "规则vsllm", "规则 vs llm"]):
+        st.session_state[_material_rule_llm_compare_dialog_state_key(task.id)] = True
+        return True, "已打开“智能修复对比（规则 vs LLM）”弹窗。", task, fields
+
+    if any(token in text for token in ["应用llm修复表", "应用llm结果", "应用对比结果"]):
+        llm_rows = _normalize_line_items(_to_editor_rows(fields.get("llm_line_items_suggested")))
+        if not llm_rows:
+            return True, "当前没有可应用的LLM修复表，请先点“智能修复对比（规则 vs LLM）”生成。", task, fields
+        old_rows = _normalize_line_items(_to_editor_rows(fields.get("line_items")))
+        _material_agent_push_undo_snapshot(task.id, fields)
+        new_fields = dict(fields)
+        new_fields["auto_split_enabled"] = False
+        new_fields["line_items"] = llm_rows
+        new_fields["amount"] = _format_amount(_line_items_total(llm_rows))
+        ok, err = _material_agent_apply_updates(task.id, new_fields)
+        if not ok:
+            return True, f"应用LLM修复表失败：{err}", task, fields
+        updated_task = local_runner.get_task(task.id) or task
+        updated_fields = _material_agent_extract_fields(updated_task)
+        _material_agent_record_change(task.id, "apply_compare", _material_agent_build_row_diff(old_rows, llm_rows), text)
+        return True, "已将LLM修复表应用到主表。", updated_task, updated_fields
 
     if "重新识别" in text:
         try:
@@ -3102,6 +4237,7 @@ def _material_agent_apply_chat_command(
             return True, "行号超出范围。", task, fields
         removed = rows.pop(idx)
         new_fields = dict(fields)
+        new_fields["auto_split_enabled"] = False
         new_fields["line_items"] = rows
         ok, err = _material_agent_apply_updates(task.id, new_fields)
         if not ok:
@@ -3139,6 +4275,7 @@ def _material_agent_apply_chat_command(
         updated_rows = [dict(row) for row in rows]
         updated_rows.append(payload)
         new_fields = dict(fields)
+        new_fields["auto_split_enabled"] = False
         new_fields["line_items"] = updated_rows
         ok, err = _material_agent_apply_updates(task.id, new_fields)
         if not ok:
@@ -3160,6 +4297,7 @@ def _material_agent_apply_chat_command(
             updated_rows[idx][field_name] = value
 
         new_fields = dict(fields)
+        new_fields["auto_split_enabled"] = False
         new_fields["line_items"] = updated_rows
         ok, err = _material_agent_apply_updates(task.id, new_fields)
         if not ok:
@@ -3180,18 +4318,8 @@ def _material_agent_apply_chat_command(
         fields_text = "、".join(changed_fields) if changed_fields else "字段"
         return True, f"已更新第{idx + 1}行：{fields_text}。", updated_task, updated_fields
 
-    if any(token in text for token in ["分列修复", "修复项目规格", "修复项目名称和规格", "规格拆分"]):
-        fixed_rows, changed = _material_agent_auto_split_rows(rows)
-        if changed <= 0:
-            return True, "没有检测到可修复的项目名称/规格混杂行。", task, fields
-        new_fields = dict(fields)
-        new_fields["line_items"] = fixed_rows
-        ok, err = _material_agent_apply_updates(task.id, new_fields)
-        if not ok:
-            return True, f"修复失败：{err}", task, fields
-        updated_task = local_runner.get_task(task.id) or task
-        updated_fields = _material_agent_extract_fields(updated_task)
-        return True, f"已完成分列修复，调整 {changed} 行。", updated_task, updated_fields
+    if any(token in text for token in ["智能修复", "agent修复", "llm修复", "可疑行修复", "案例修复"]):
+        return _material_agent_run_llm_fix(task, fields)
 
     if _material_agent_looks_like_edit_intent(text):
         return (
@@ -3211,7 +4339,7 @@ def _generate_material_agent_reply_llm(
     messages: list[dict[str, Any]],
 ) -> str | None:
     base_url = os.getenv("OLLAMA_BASE_URL", "http://127.0.0.1:11434").rstrip("/")
-    model = os.getenv("OLLAMA_CHAT_MODEL") or os.getenv("OLLAMA_MODEL", "qwen2.5vl:3b")
+    model = _chat_model()
 
     rows = _normalize_line_items(_to_editor_rows(fields.get("line_items")))
     hints = _material_agent_quality_hints(fields)
@@ -3238,6 +4366,8 @@ def _generate_material_agent_reply_llm(
         "line_count": len(rows),
         "line_items": rows[:120],
         "quality_hints": hints,
+        "low_confidence_review": list(fields.get("low_confidence_review") or [])[:40],
+        "llm_agent_stats": dict(fields.get("llm_agent_stats") or {}),
         "policy_refs": policy_refs[:4],
         "case_refs": case_lines,
     }
@@ -3335,8 +4465,9 @@ def _render_material_conversation_agent() -> None:
         if not upload_list:
             st.warning("请先上传 PDF。")
         else:
-            with st.spinner("正在识别材料发票并生成明细..."):
+            with st.spinner("正在识别材料发票，并执行 LLM 自动修复..."):
                 new_ids: list[str] = []
+                prepare_errors: list[str] = []
                 for file in upload_list:
                     task = local_runner.create_and_process_task(
                         file.name,
@@ -3345,10 +4476,18 @@ def _render_material_conversation_agent() -> None:
                         auto_export=True,
                     )
                     if task is not None:
+                        try:
+                            fields = _material_agent_extract_fields(task)
+                            _, _, prepared_task, _ = _material_agent_run_llm_fix(task, fields)
+                            task = prepared_task or task
+                        except Exception as exc:
+                            prepare_errors.append(f"{file.name}: {exc}")
                         new_ids.append(task.id)
                 if new_ids:
                     merged = list(dict.fromkeys(new_ids + task_ids))
                     st.session_state["material_agent_task_ids"] = merged
+            if prepare_errors:
+                st.warning("以下文件的自动 LLM 修复未完成，可稍后点“智能修复对比（规则 vs LLM）”补跑：\n\n- " + "\n- ".join(prepare_errors[:8]))
             st.success("材料费任务已更新。")
             st.rerun()
 
@@ -3372,10 +4511,25 @@ def _render_material_conversation_agent() -> None:
         return
 
     fields = _material_agent_extract_fields(task)
+    compare_dialog_key = _material_rule_llm_compare_dialog_state_key(task.id)
+    if bool(st.session_state.get(compare_dialog_key)):
+        _render_material_rule_llm_compare_dialog(task.id)
+
     rows = _normalize_line_items(_to_editor_rows(fields.get("line_items")))
     row_total = _line_items_total(rows)
     amount_value = _safe_float(fields.get("amount"))
     display_rows = [{"row_no": idx + 1, **row} for idx, row in enumerate(rows)]
+    display_rows_cn = [
+        {
+            "行号": idx + 1,
+            "项目名称(含星号)": str(row.get("item_name") or ""),
+            "规格型号": str(row.get("spec") or ""),
+            "数量": str(row.get("quantity") or ""),
+            "单位": str(row.get("unit") or ""),
+            "每项含税总价": str(row.get("line_total_with_tax") or ""),
+        }
+        for idx, row in enumerate(rows)
+    ]
 
     m1, m2, m3, m4 = st.columns(4)
     m1.metric("明细行数", len(rows))
@@ -3391,54 +4545,71 @@ def _render_material_conversation_agent() -> None:
     else:
         st.success("当前明细质量检查通过。")
 
-    edited_rows = st.data_editor(
-        display_rows,
-        use_container_width=True,
-        hide_index=True,
-        num_rows="dynamic",
-        key=f"material_agent_editor_{task.id}",
-        column_config={
-            "row_no": st.column_config.NumberColumn("行号", disabled=True, width="small"),
-            "item_name": st.column_config.TextColumn("项目名称(含星号)", required=False),
-            "spec": st.column_config.TextColumn("规格型号", required=False),
-            "quantity": st.column_config.TextColumn("数量", required=False),
-            "unit": st.column_config.TextColumn("单位", required=False),
-            "line_total_with_tax": st.column_config.TextColumn("每项含税总价", required=False),
-        },
-    )
-    editor_rows = _normalize_line_items(_to_editor_rows(edited_rows))
-    editor_total = _line_items_total(editor_rows)
-    st.caption(f"编辑区明细合计：{_format_amount(editor_total) if editor_total is not None else '-'}")
+    review_items = list(fields.get("low_confidence_review") or [])
+    if review_items:
+        st.info(f"人工复核区：{len(review_items)} 条低置信度项。")
+        open_key = _material_review_dialog_state_key(task.id)
+        if open_key not in st.session_state:
+            st.session_state[open_key] = True
+        open_dialog = st.button(
+            "打开质量风险复核弹窗（双表对比）",
+            use_container_width=True,
+            key=f"material_review_open_{task.id}",
+        )
+        if open_dialog:
+            st.session_state[open_key] = True
+        if bool(st.session_state.get(open_key)):
+            _render_material_review_dialog(task.id)
 
-    e1, e2 = st.columns(2)
-    if e1.button("应用表格修正并重导出", use_container_width=True, key=f"material_agent_apply_table_{task.id}"):
-        new_fields = dict(fields)
-        new_fields["line_items"] = editor_rows
-        if editor_total is not None:
-            new_fields["amount"] = _format_amount(editor_total)
-        ok, err = _material_agent_apply_updates(task.id, new_fields)
-        if ok:
-            st.success("表格修正已保存并重导出。")
+        review_view = []
+        for item in review_items:
+            if not isinstance(item, dict):
+                continue
+            confidence_raw = item.get("confidence")
+            try:
+                confidence_text = f"{float(confidence_raw) * 100:.1f}%"
+            except (TypeError, ValueError):
+                confidence_text = str(confidence_raw or "")
+            review_view.append(
+                {
+                    "行号": item.get("row_no"),
+                    "项目名称": item.get("item_name"),
+                    "规格型号": item.get("spec"),
+                    "建议项目名称": item.get("suggested_item_name"),
+                    "建议规格型号": item.get("suggested_spec"),
+                    "置信度": confidence_text,
+                    "风险类型": "、".join(item.get("risk_types") or []),
+                    "原因": item.get("reason"),
+                }
+            )
+        if review_view:
+            st.dataframe(review_view, use_container_width=True, hide_index=True)
+    else:
+        st.session_state.pop(_material_review_dialog_state_key(task.id), None)
+
+    st.dataframe(display_rows_cn, use_container_width=True, hide_index=True)
+
+    if st.button("智能修复对比（规则 vs LLM）", use_container_width=True, key=f"material_agent_llm_compare_{task.id}"):
+        latest_task = local_runner.get_task(task.id) or task
+        latest_fields = _material_agent_extract_fields(latest_task)
+        baseline_rows = _normalize_line_items(_to_editor_rows(latest_fields.get("rule_line_items_baseline")))
+        llm_rows = _normalize_line_items(_to_editor_rows(latest_fields.get("llm_line_items_suggested")))
+        if not baseline_rows or not llm_rows:
+            with st.spinner("首次生成 LLM 修复结果并构建对比..."):
+                handled, reply, updated_task, updated_fields = _material_agent_run_llm_fix(latest_task, latest_fields)
+            if not handled:
+                st.error(reply)
+            else:
+                latest_task = updated_task or latest_task
+                latest_fields = updated_fields or latest_fields
+                st.success(reply)
+                baseline_rows = _normalize_line_items(_to_editor_rows(latest_fields.get("rule_line_items_baseline")))
+                llm_rows = _normalize_line_items(_to_editor_rows(latest_fields.get("llm_line_items_suggested")))
+        if baseline_rows and llm_rows:
+            st.session_state[compare_dialog_key] = True
             st.rerun()
         else:
-            st.error(f"保存失败：{err}")
-
-    if e2.button("执行分列修复（项目/规格）", use_container_width=True, key=f"material_agent_split_fix_{task.id}"):
-        fixed_rows, changed = _material_agent_auto_split_rows(editor_rows)
-        if changed <= 0:
-            st.info("没有检测到可修复行。")
-        else:
-            new_fields = dict(fields)
-            new_fields["line_items"] = fixed_rows
-            fixed_total = _line_items_total(fixed_rows)
-            if fixed_total is not None:
-                new_fields["amount"] = _format_amount(fixed_total)
-            ok, err = _material_agent_apply_updates(task.id, new_fields)
-            if ok:
-                st.success(f"分列修复完成，调整 {changed} 行。")
-                st.rerun()
-            else:
-                st.error(f"修复失败：{err}")
+            st.error("暂未生成可对比的规则表/LLM表。")
 
     _render_export_download(task, key_scope="material_agent")
 
@@ -3457,7 +4628,9 @@ def _render_material_conversation_agent() -> None:
                 "role": "assistant",
                 "content": (
                     "已进入材料费整理模式。你可以直接说：`第3行规格改为M20X1.5`、`删除第5行`、"
-                    "`新增一行 项目名称=... 规格=... 数量=... 单位=... 金额=...`、`重新识别`、`分列修复`。"
+                    "`新增一行 项目名称=... 规格=... 数量=... 单位=... 金额=...`、`重新识别`、`智能修复`、"
+                    "`打开对比`、`应用LLM修复表`、`撤销上一步`、`查看最近变更`，"
+                    "或点“智能修复对比（规则 vs LLM）”。"
                 ),
             }
         ],
@@ -3514,6 +4687,7 @@ def main() -> None:
     st.caption("按费用类型选择流程：材料费 / 差旅费")
 
     init_runtime()
+    _render_model_runtime_panel()
 
     flow_mode = st.radio(
         "选择报销流程",
