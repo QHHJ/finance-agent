@@ -4,7 +4,7 @@ import hashlib
 import json
 from typing import Any
 
-from . import rag_store
+from app.retrieval.factory import get_retriever
 
 
 def _safe_text(value: Any) -> str:
@@ -166,11 +166,12 @@ def learn_from_material_task(task: Any) -> int:
             },
         }
     ]
-    learned = rag_store.upsert_documents(source_type="material_case", source_id=task_id, documents=documents)
+    retriever = get_retriever()
+    learned = retriever.upsert_documents(source_type="material_case", source_id=task_id, documents=documents)
 
     fix_case_docs = _build_material_fix_case_documents(task, extracted)
     if fix_case_docs:
-        learned += rag_store.upsert_documents(
+        learned += retriever.upsert_documents(
             source_type="material_fix_case",
             source_id=task_id,
             documents=fix_case_docs,
@@ -249,4 +250,5 @@ def learn_from_travel_profiles(
         }
     )
 
-    return rag_store.upsert_documents(source_type="travel_case", source_id=session_sig, documents=documents)
+    retriever = get_retriever()
+    return retriever.upsert_documents(source_type="travel_case", source_id=session_sig, documents=documents)

@@ -8,14 +8,15 @@ from pathlib import Path
 import re
 from typing import Any
 from datetime import datetime
-import zipfile
 
 import requests
 import streamlit as st
 from pypdf import PdfReader
 
 from app.runtime import init_runtime
-from app.services import extractor, learning, local_runner, material_fix_agent, rag_retriever
+from app.services import extractor, local_runner, rag_retriever
+from app.usecases import material_agent as material_usecase
+from app.usecases import travel_agent as travel_usecase
 
 LINE_ITEM_FIELDS = ["item_name", "spec", "quantity", "unit", "line_total_with_tax"]
 UPLOAD_TYPES = ["pdf", "png", "jpg", "jpeg", "webp"]
@@ -749,11 +750,7 @@ def _auto_extract_amount_from_payment(uploaded_file) -> float | None:
 
 
 def _as_uploaded_list(uploaded_value) -> list[Any]:
-    if uploaded_value is None:
-        return []
-    if isinstance(uploaded_value, list):
-        return [item for item in uploaded_value if item is not None]
-    return [uploaded_value]
+    return travel_usecase.as_uploaded_list(uploaded_value)
 
 
 def _files_signature(files: list[Any]) -> str:
@@ -1686,50 +1683,11 @@ def _build_travel_file_profile(uploaded_file: Any, index: int) -> dict[str, Any]
 
 
 def _sum_profile_amount(profiles: list[dict[str, Any]]) -> float | None:
-    numbers = [p.get("amount") for p in profiles if p.get("amount") is not None]
-    if not numbers:
-        return None
-    return float(sum(numbers))
+    return travel_usecase.sum_profile_amount(profiles)
 
 
 def _split_profiles_to_go_return(profiles: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
-    if not profiles:
-        return [], []
-    if len(profiles) == 1:
-        return profiles[:], []
-
-    with_date = [p for p in profiles if p.get("date_obj") is not None]
-    if with_date:
-        unique_dates = sorted({p["date_obj"].date() for p in with_date})
-        if len(unique_dates) >= 2:
-            split = max(1, len(unique_dates) // 2)
-            go_dates = set(unique_dates[:split])
-            go: list[dict[str, Any]] = []
-            ret: list[dict[str, Any]] = []
-            undecided: list[dict[str, Any]] = []
-            for profile in profiles:
-                date_obj = profile.get("date_obj")
-                if date_obj is None:
-                    undecided.append(profile)
-                    continue
-                if date_obj.date() in go_dates:
-                    go.append(profile)
-                else:
-                    ret.append(profile)
-            for profile in undecided:
-                if len(go) <= len(ret):
-                    go.append(profile)
-                else:
-                    ret.append(profile)
-            if not ret and len(go) > 1:
-                ret.append(go.pop())
-            return go, ret
-
-    ordered = sorted(profiles, key=lambda p: p.get("index", 0))
-    split = max(1, len(ordered) // 2)
-    if split >= len(ordered):
-        split = len(ordered) - 1
-    return ordered[:split], ordered[split:]
+    return travel_usecase.split_profiles_to_go_return(profiles)
 
 
 def _split_payment_profiles_to_go_return(
@@ -1737,127 +1695,23 @@ def _split_payment_profiles_to_go_return(
     go_target: float | None,
     return_target: float | None,
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
-    if not payments:
-        return [], []
-    if len(payments) == 1:
-        return payments[:], []
-
-    can_amount_match = (
-        go_target is not None
-        and return_target is not None
-        and all(p.get("amount") is not None for p in payments)
-        and len(payments) <= 18
-    )
-    if can_amount_match:
-        values = [float(p["amount"]) for p in payments]
-        total = sum(values)
-        n = len(values)
-        all_mask = (1 << n) - 1
-        best_mask = None
-        best_score = float("inf")
-
-        for mask in range(0, all_mask + 1):
-            go_sum = 0.0
-            for idx in range(n):
-                if (mask >> idx) & 1:
-                    go_sum += values[idx]
-            return_sum = total - go_sum
-            score = abs(go_sum - go_target) + abs(return_sum - return_target)
-            if mask in (0, all_mask):
-                score += 10000.0
-            if score < best_score:
-                best_score = score
-                best_mask = mask
-
-        if best_mask is not None:
-            go: list[dict[str, Any]] = []
-            ret: list[dict[str, Any]] = []
-            for idx, profile in enumerate(payments):
-                if (best_mask >> idx) & 1:
-                    go.append(profile)
-                else:
-                    ret.append(profile)
-            if go and ret:
-                return go, ret
-
-    return _split_profiles_to_go_return(payments)
+    return travel_usecase.split_payment_profiles_to_go_return(payments, go_target, return_target)
 
 
 def _build_assignment_from_profiles(profiles: list[dict[str, Any]]) -> dict[str, Any]:
-    transport_tickets = [p for p in profiles if p.get("doc_type") == "transport_ticket"]
-    transport_payments = [p for p in profiles if p.get("doc_type") == "transport_payment"]
-    flight_details = [p for p in profiles if p.get("doc_type") == "flight_detail"]
-    hotel_invoices = [p for p in profiles if p.get("doc_type") == "hotel_invoice"]
-    hotel_payments = [p for p in profiles if p.get("doc_type") == "hotel_payment"]
-    hotel_orders = [p for p in profiles if p.get("doc_type") == "hotel_order"]
-    unknowns = [p for p in profiles if p.get("doc_type") == "unknown"]
-
-    go_tickets, return_tickets = _split_profiles_to_go_return(transport_tickets)
-    go_details, return_details = _split_profiles_to_go_return(flight_details)
-
-    go_ticket_amount = _sum_profile_amount(go_tickets)
-    return_ticket_amount = _sum_profile_amount(return_tickets)
-    go_payments, return_payments = _split_payment_profiles_to_go_return(
-        transport_payments,
-        go_ticket_amount,
-        return_ticket_amount,
-    )
-    go_payment_amount = _sum_profile_amount(go_payments)
-    return_payment_amount = _sum_profile_amount(return_payments)
-    hotel_invoice_amount = _sum_profile_amount(hotel_invoices)
-    hotel_payment_amount = _sum_profile_amount(hotel_payments)
-
-    for p in go_tickets:
-        p["slot"] = "go_ticket"
-    for p in go_payments:
-        p["slot"] = "go_payment"
-    for p in go_details:
-        p["slot"] = "go_detail"
-    for p in return_tickets:
-        p["slot"] = "return_ticket"
-    for p in return_payments:
-        p["slot"] = "return_payment"
-    for p in return_details:
-        p["slot"] = "return_detail"
-    for p in hotel_invoices:
-        p["slot"] = "hotel_invoice"
-    for p in hotel_payments:
-        p["slot"] = "hotel_payment"
-    for p in hotel_orders:
-        p["slot"] = "hotel_order"
-    for p in unknowns:
-        p["slot"] = "unknown"
-
-    assignment = {
-        "go_ticket": [p["file"] for p in go_tickets],
-        "go_payment": [p["file"] for p in go_payments],
-        "go_detail": [p["file"] for p in go_details],
-        "return_ticket": [p["file"] for p in return_tickets],
-        "return_payment": [p["file"] for p in return_payments],
-        "return_detail": [p["file"] for p in return_details],
-        "hotel_invoice": [p["file"] for p in hotel_invoices],
-        "hotel_payment": [p["file"] for p in hotel_payments],
-        "hotel_order": [p["file"] for p in hotel_orders],
-        "unknown": [p["file"] for p in unknowns],
-        "go_ticket_amount": go_ticket_amount,
-        "go_payment_amount": go_payment_amount,
-        "return_ticket_amount": return_ticket_amount,
-        "return_payment_amount": return_payment_amount,
-        "hotel_invoice_amount": hotel_invoice_amount,
-        "hotel_payment_amount": hotel_payment_amount,
-    }
-    return assignment
+    return travel_usecase.build_assignment_from_profiles(profiles)
 
 
 def _organize_travel_materials(
     pool_files: list[Any],
     manual_overrides: dict[str, str] | None = None,
 ) -> tuple[dict[str, Any], list[dict[str, Any]]]:
-    profiles = [_build_travel_file_profile(file, idx) for idx, file in enumerate(pool_files)]
-    if manual_overrides:
-        _apply_manual_overrides_to_profiles(profiles, manual_overrides)
-    assignment = _build_assignment_from_profiles(profiles)
-    return assignment, profiles
+    return travel_usecase.organize_materials(
+        pool_files,
+        build_profile=_build_travel_file_profile,
+        manual_overrides=manual_overrides,
+        apply_overrides=_apply_manual_overrides_to_profiles,
+    )
 
 
 def _slot_label(slot: str) -> str:
@@ -1890,52 +1744,11 @@ def _doc_type_label(doc_type: str) -> str:
 
 
 def _build_travel_agent_status(assignment: dict[str, Any]) -> dict[str, Any]:
-    required_slots = [
-        ("go_ticket", "去程机票发票/票据"),
-        ("go_payment", "去程支付记录"),
-        ("go_detail", "去程机票明细"),
-        ("return_ticket", "返程机票发票/票据"),
-        ("return_payment", "返程支付记录"),
-        ("return_detail", "返程机票明细"),
-        ("hotel_invoice", "酒店发票"),
-        ("hotel_payment", "酒店支付记录"),
-        ("hotel_order", "酒店订单截图"),
-    ]
-    missing = [label for key, label in required_slots if not _as_uploaded_list(assignment.get(key))]
-
-    issues: list[str] = []
-    comparisons = [
-        ("去程交通", assignment.get("go_ticket_amount"), assignment.get("go_payment_amount")),
-        ("返程交通", assignment.get("return_ticket_amount"), assignment.get("return_payment_amount")),
-        ("酒店", assignment.get("hotel_invoice_amount"), assignment.get("hotel_payment_amount")),
-    ]
-    for name, left, right in comparisons:
-        if left is None or right is None:
-            continue
-        if abs(float(left) - float(right)) > 0.01:
-            issues.append(f"{name}票据金额与支付记录金额不一致：{_format_amount(left)} vs {_format_amount(right)}")
-
-    unknown_files = _as_uploaded_list(assignment.get("unknown"))
-    tips: list[str] = []
-    if unknown_files:
-        tips.append(f"有 {len(unknown_files)} 份材料尚未识别到明确类型，可在聊天区说明用途后重传。")
-
-    complete = not missing and not issues
-    return {"missing": missing, "issues": issues, "tips": tips, "complete": complete}
+    return travel_usecase.build_travel_agent_status(assignment)
 
 
 def _merge_uploaded_lists(first: list[Any], second: list[Any]) -> list[Any]:
-    merged: list[Any] = []
-    seen: set[str] = set()
-    for item in list(first) + list(second):
-        name = str(getattr(item, "name", ""))
-        size = str(getattr(item, "size", ""))
-        key = f"{name}:{size}"
-        if key in seen:
-            continue
-        seen.add(key)
-        merged.append(item)
-    return merged
+    return travel_usecase.merge_uploaded_lists(first, second)
 
 
 def _target_doc_type_from_user_text(user_text: str, file_name: str) -> str | None:
@@ -2508,10 +2321,7 @@ def _render_travel_conversation_agent() -> dict[str, Any]:
                     assignment = _build_assignment_from_profiles(profiles)
                     st.session_state["travel_agent_assignment"] = assignment
                     st.session_state["travel_agent_profiles"] = profiles
-                    try:
-                        learning.learn_from_travel_profiles(profiles, assignment, reason="manual_table")
-                    except Exception:
-                        pass
+                    travel_usecase.learn_from_profiles(profiles, assignment, reason="manual_table")
                     st.success(f"已应用 {changed} 条分类修正。")
                     st.rerun()
                 else:
@@ -2567,10 +2377,7 @@ def _render_travel_conversation_agent() -> dict[str, Any]:
             status = _build_travel_agent_status(assignment)
             st.session_state["travel_agent_assignment"] = assignment
             st.session_state["travel_agent_profiles"] = profiles
-            try:
-                learning.learn_from_travel_profiles(profiles, assignment, reason="manual_chat")
-            except Exception:
-                pass
+            travel_usecase.learn_from_profiles(profiles, assignment, reason="manual_chat")
             changed_preview = "、".join(changed_names[:3])
             if changed_count > 3:
                 changed_preview += f" 等{changed_count}个文件"
@@ -2596,39 +2403,23 @@ def _render_travel_conversation_agent() -> dict[str, Any]:
 
 
 def _sanitize_export_name(name: str) -> str:
-    cleaned = re.sub(r'[\\/:*?"<>|]+', "_", (name or "").strip())
-    cleaned = cleaned.strip(" .")
-    return cleaned or "差旅报销材料"
+    return travel_usecase.sanitize_export_name(name)
 
 
 def _safe_uploaded_filename(name: str, default_stem: str) -> str:
-    raw = Path(name or "").name
-    if not raw:
-        raw = default_stem
-    cleaned = re.sub(r'[\\/:*?"<>|]+', "_", raw).strip()
-    return cleaned or default_stem
+    return travel_usecase.safe_uploaded_filename(name, default_stem)
 
 
 def _amount_suffix(amount: float | None) -> str:
-    if amount is None:
-        return "金额未知"
-    if abs(amount - round(amount)) <= 0.01:
-        return f"{int(round(amount))}元"
-    return f"{amount:.2f}元"
+    return travel_usecase.amount_suffix(amount)
 
 
-def _zip_ensure_dir(zip_file: zipfile.ZipFile, dir_path: str) -> None:
-    normalized = dir_path.replace("\\", "/").rstrip("/") + "/"
-    zip_file.writestr(normalized, b"")
+def _zip_ensure_dir(zip_file, dir_path: str) -> None:
+    travel_usecase.zip_ensure_dir(zip_file, dir_path)
 
 
-def _zip_write_uploaded_files(zip_file: zipfile.ZipFile, target_dir: str, files: list[Any]) -> None:
-    _zip_ensure_dir(zip_file, target_dir)
-    for idx, uploaded in enumerate(files, start=1):
-        original_name = str(getattr(uploaded, "name", ""))
-        safe_name = _safe_uploaded_filename(original_name, f"file_{idx}")
-        stored_name = f"{idx:02d}_{safe_name}"
-        zip_file.writestr(f"{target_dir}/{stored_name}", uploaded.getvalue())
+def _zip_write_uploaded_files(zip_file, target_dir: str, files: list[Any]) -> None:
+    travel_usecase.zip_write_uploaded_files(zip_file, target_dir, files)
 
 
 def _build_travel_package_zip(
@@ -2649,57 +2440,24 @@ def _build_travel_package_zip(
     hotel_invoice_amount: float | None,
     hotel_payment_amount: float | None,
 ) -> bytes:
-    root_name = _sanitize_export_name(package_name)
-    buffer = BytesIO()
-    with zipfile.ZipFile(buffer, mode="w", compression=zipfile.ZIP_DEFLATED) as zip_file:
-        go_root = f"{root_name}/出差去程交通报销"
-        _zip_write_uploaded_files(
-            zip_file,
-            f"{go_root}/去程机票发票_{_amount_suffix(go_ticket_amount)}",
-            go_ticket_files,
-        )
-        _zip_write_uploaded_files(
-            zip_file,
-            f"{go_root}/去程支付记录_{_amount_suffix(go_payment_amount)}",
-            go_payment_files,
-        )
-        _zip_write_uploaded_files(
-            zip_file,
-            f"{go_root}/去程机票明细",
-            go_detail_files,
-        )
-
-        return_root = f"{root_name}/出差返程交通报销"
-        _zip_write_uploaded_files(
-            zip_file,
-            f"{return_root}/返程机票发票_{_amount_suffix(return_ticket_amount)}",
-            return_ticket_files,
-        )
-        _zip_write_uploaded_files(
-            zip_file,
-            f"{return_root}/返程支付记录_{_amount_suffix(return_payment_amount)}",
-            return_payment_files,
-        )
-        _zip_write_uploaded_files(
-            zip_file,
-            f"{return_root}/返程机票明细",
-            return_detail_files,
-        )
-
-        hotel_root = f"{root_name}/酒店报销"
-        _zip_write_uploaded_files(
-            zip_file,
-            f"{hotel_root}/酒店发票_{_amount_suffix(hotel_invoice_amount)}",
-            hotel_invoice_files,
-        )
-        _zip_write_uploaded_files(
-            zip_file,
-            f"{hotel_root}/支付记录_{_amount_suffix(hotel_payment_amount)}",
-            hotel_payment_files,
-        )
-        _zip_write_uploaded_files(zip_file, f"{hotel_root}/订单截图", hotel_order_files)
-    buffer.seek(0)
-    return buffer.getvalue()
+    return travel_usecase.build_travel_package_zip(
+        package_name=package_name,
+        go_ticket_files=go_ticket_files,
+        go_payment_files=go_payment_files,
+        go_detail_files=go_detail_files,
+        return_ticket_files=return_ticket_files,
+        return_payment_files=return_payment_files,
+        return_detail_files=return_detail_files,
+        hotel_invoice_files=hotel_invoice_files,
+        hotel_payment_files=hotel_payment_files,
+        hotel_order_files=hotel_order_files,
+        go_ticket_amount=go_ticket_amount,
+        go_payment_amount=go_payment_amount,
+        return_ticket_amount=return_ticket_amount,
+        return_payment_amount=return_payment_amount,
+        hotel_invoice_amount=hotel_invoice_amount,
+        hotel_payment_amount=hotel_payment_amount,
+    )
 
 
 def _render_travel_package_export() -> None:
@@ -2884,80 +2642,16 @@ MATERIAL_AGENT_FIELDS = ["item_name", "spec", "quantity", "unit", "line_total_wi
 
 
 def _material_agent_extract_fields(task) -> dict[str, Any]:
-    extracted = dict(task.extracted_data or {})
-    rows = _normalize_line_items(_to_editor_rows(extracted.get("line_items")))
-    auto_split_enabled = bool(extracted.get("auto_split_enabled", True))
-    if rows and auto_split_enabled:
-        auto_fixed_rows, _ = _material_agent_auto_split_rows(rows)
-        if auto_fixed_rows:
-            rows = auto_fixed_rows
-    extracted["line_items"] = rows
-    extracted["auto_split_enabled"] = auto_split_enabled
-
-    if not str(extracted.get("item_content") or "").strip() and rows:
-        names = [str(row.get("item_name") or "").strip() for row in rows if str(row.get("item_name") or "").strip()]
-        extracted["item_content"] = "；".join(names[:8])
-
-    amount_text = str(extracted.get("amount") or "").strip()
-    if not amount_text:
-        total = _line_items_total(rows)
-        if total is not None:
-            extracted["amount"] = _format_amount(total)
-    review_items = extracted.get("low_confidence_review")
-    if not isinstance(review_items, list):
-        extracted["low_confidence_review"] = []
-    llm_stats = extracted.get("llm_agent_stats")
-    if not isinstance(llm_stats, dict):
-        extracted["llm_agent_stats"] = {}
-    rule_rows = _normalize_line_items(_to_editor_rows(extracted.get("rule_line_items_baseline")))
-    llm_rows = _normalize_line_items(_to_editor_rows(extracted.get("llm_line_items_suggested")))
-    extracted["rule_line_items_baseline"] = rule_rows
-    extracted["llm_line_items_suggested"] = llm_rows
-    return extracted
+    return material_usecase.extract_fields(task)
 
 
 def _material_agent_build_fields_payload(fields: dict[str, Any]) -> dict[str, Any]:
-    rows = _normalize_line_items(_to_editor_rows(fields.get("line_items")))
-    amount_text = str(fields.get("amount") or "").strip()
-    if not amount_text:
-        total = _line_items_total(rows)
-        if total is not None:
-            amount_text = _format_amount(total)
-
-    item_content = str(fields.get("item_content") or "").strip()
-    if not item_content and rows:
-        names = [str(row.get("item_name") or "").strip() for row in rows if str(row.get("item_name") or "").strip()]
-        item_content = "；".join(names[:8])
-
-    return {
-        "invoice_number": str(fields.get("invoice_number") or "").strip() or None,
-        "invoice_date": str(fields.get("invoice_date") or "").strip() or None,
-        "amount": amount_text or None,
-        "tax_amount": str(fields.get("tax_amount") or "").strip() or None,
-        "seller": str(fields.get("seller") or "").strip() or None,
-        "buyer": str(fields.get("buyer") or "").strip() or None,
-        "bill_type": str(fields.get("bill_type") or "").strip() or None,
-        "item_content": item_content or None,
-        "line_items": rows,
-        "low_confidence_review": list(fields.get("low_confidence_review") or []),
-        "llm_agent_stats": dict(fields.get("llm_agent_stats") or {}),
-        "auto_split_enabled": bool(fields.get("auto_split_enabled", True)),
-        "rule_line_items_baseline": _normalize_line_items(_to_editor_rows(fields.get("rule_line_items_baseline"))),
-        "llm_line_items_suggested": _normalize_line_items(_to_editor_rows(fields.get("llm_line_items_suggested"))),
-    }
+    return material_usecase.build_fields_payload(fields)
 
 
 def _material_agent_apply_updates(task_id: str, fields: dict[str, Any]) -> tuple[bool, str]:
-    try:
-        corrections = {
-            "expense_category": "材料费",
-            "extracted_fields": _material_agent_build_fields_payload(fields),
-        }
-        local_runner.apply_corrections(task_id, corrections)
-        local_runner.export_task(task_id, export_format="both")
-        return True, ""
-    except Exception as exc:
-        return False, str(exc)
+    result = material_usecase.apply_updates(task_id, fields)
+    return result.ok, result.message
 
 
 def _material_agent_quality_hints(fields: dict[str, Any]) -> list[str]:
@@ -3030,134 +2724,18 @@ def _material_agent_quality_hints(fields: dict[str, Any]) -> list[str]:
 
 
 def _material_agent_split_name_spec(name: str, spec: str) -> tuple[str, str]:
-    new_name = str(name or "").strip()
-    new_spec = str(spec or "").strip()
-
-    splitter = getattr(extractor, "_split_item_name_and_spec", None)
-    refiner = getattr(extractor, "_refine_name_spec_boundary", None)
-    if callable(splitter):
-        try:
-            new_name, new_spec = splitter(new_name, new_spec)
-        except Exception:
-            pass
-    if callable(refiner):
-        try:
-            new_name, new_spec = refiner(new_name, new_spec)
-        except Exception:
-            pass
-
-    if not new_spec:
-        match = re.search(
-            r"(M\d+(?:[Xx*]\d+(?:\.\d+)?)?|[A-Za-z][A-Za-z0-9+\-_.]{1,20}专用|[A-Za-z]{2,}\d[\w\-./]*|\d+(?:\.\d+)?(?:mm|cm|m|kg|g|V|W|A|Hz)|\d+(?:\.\d+)?\s*(?:-|~|～|x|X|[*])\s*\d+(?:\.\d+)?(?:mm|cm|m)|超薄)$",
-            new_name,
-        )
-        if match:
-            candidate = match.group(1).strip()
-            head = new_name[: match.start()].strip(" -_/，,;；:：")
-            if head and candidate and candidate not in {"电子元件", "金属制品"}:
-                new_name, new_spec = head, candidate
-
-    if new_spec and new_name and new_name.endswith(new_spec):
-        trimmed = new_name[: -len(new_spec)].rstrip(" -_/，,;；:：")
-        if trimmed:
-            new_name = trimmed
-
-    return new_name, new_spec
+    return material_usecase.split_name_spec(name, spec)
 
 
 def _material_agent_auto_split_rows(rows: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], int]:
-    normalized_rows = _normalize_line_items(_to_editor_rows(rows))
-    changed = 0
-    output: list[dict[str, Any]] = []
-
-    for row in normalized_rows:
-        name = str(row.get("item_name") or "").strip()
-        spec = str(row.get("spec") or "").strip()
-        new_name, new_spec = _material_agent_split_name_spec(name, spec)
-        if new_name != name or new_spec != spec:
-            changed += 1
-
-        output.append(
-            {
-                "item_name": new_name,
-                "spec": new_spec,
-                "quantity": str(row.get("quantity") or "").strip(),
-                "unit": str(row.get("unit") or "").strip(),
-                "line_total_with_tax": str(row.get("line_total_with_tax") or "").strip(),
-            }
-        )
-    return output, changed
+    return material_usecase.auto_split_rows(rows)
 
 
 def _material_agent_run_llm_fix(
     task,
     fields: dict[str, Any],
 ) -> tuple[bool, str, Any, dict[str, Any]]:
-    rows = _normalize_line_items(_to_editor_rows(fields.get("line_items")))
-    if not rows:
-        return True, "当前无明细可分析。", task, fields
-
-    header_context = {
-        "invoice_number": fields.get("invoice_number"),
-        "invoice_date": fields.get("invoice_date"),
-        "bill_type": fields.get("bill_type"),
-        "item_content": fields.get("item_content"),
-        "seller": fields.get("seller"),
-        "buyer": fields.get("buyer"),
-        "amount": fields.get("amount"),
-    }
-    raw_text = str(getattr(task, "raw_text", "") or "")
-
-    try:
-        result = material_fix_agent.run_llm_row_repair(
-            rows,
-            header_context=header_context,
-            raw_text=raw_text,
-        )
-    except Exception as exc:
-        return True, f"LLM修复执行失败：{exc}", task, fields
-
-    repaired_rows = _normalize_line_items(_to_editor_rows(result.get("rows")))
-    review_items = list(result.get("review_items") or [])
-    llm_stats = dict(result.get("stats") or {})
-    llm_error = str(result.get("llm_error") or "").strip()
-
-    new_fields = dict(fields)
-    new_fields["auto_split_enabled"] = True
-    # Keep first rule extraction snapshot for later "规则 vs LLM" comparison.
-    rule_baseline = _normalize_line_items(_to_editor_rows(fields.get("rule_line_items_baseline")))
-    if rule_baseline:
-        new_fields["rule_line_items_baseline"] = rule_baseline
-    else:
-        new_fields["rule_line_items_baseline"] = list(rows)
-
-    if repaired_rows:
-        new_fields["line_items"] = repaired_rows
-        new_fields["llm_line_items_suggested"] = list(repaired_rows)
-    else:
-        new_fields["llm_line_items_suggested"] = list(rows)
-    fixed_total = _line_items_total(repaired_rows)
-    if fixed_total is not None:
-        new_fields["amount"] = _format_amount(fixed_total)
-    new_fields["low_confidence_review"] = review_items
-    new_fields["llm_agent_stats"] = llm_stats
-    if llm_error:
-        new_fields["llm_error"] = llm_error
-
-    ok, err = _material_agent_apply_updates(task.id, new_fields)
-    if not ok:
-        return True, f"LLM修复结果保存失败：{err}", task, fields
-
-    updated_task = local_runner.get_task(task.id) or task
-    updated_fields = _material_agent_extract_fields(updated_task)
-    summary = (
-        f"LLM可疑行分析完成：疑似 {llm_stats.get('suspicious_rows', 0)} 行，"
-        f"自动修复 {llm_stats.get('auto_fixed_rows', 0)} 行，"
-        f"待人工复核 {len(review_items)} 行。"
-    )
-    if llm_error:
-        summary += f"（部分分块失败：{llm_error[:120]}）"
-    return True, summary, updated_task, updated_fields
+    return material_usecase.run_llm_fix(task, fields)
 
 
 def _material_review_dialog_state_key(task_id: str) -> str:
@@ -3169,66 +2747,7 @@ def _material_review_editor_key(task_id: str) -> str:
 
 
 def _material_agent_build_review_compare_rows(fields: dict[str, Any]) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
-    rows = _normalize_line_items(_to_editor_rows(fields.get("line_items")))
-    review_items = list(fields.get("low_confidence_review") or [])
-
-    left_rows: list[dict[str, Any]] = []
-    right_rows: list[dict[str, Any]] = []
-    for item in review_items:
-        if not isinstance(item, dict):
-            continue
-        try:
-            row_no = int(item.get("row_no") or 0)
-        except (TypeError, ValueError):
-            continue
-        if row_no <= 0:
-            continue
-
-        current = rows[row_no - 1] if row_no <= len(rows) else {}
-        cur_name = str(current.get("item_name") or item.get("item_name") or "").strip()
-        cur_spec = str(current.get("spec") or item.get("spec") or "").strip()
-        cur_quantity = str(current.get("quantity") or "").strip()
-        cur_unit = str(current.get("unit") or "").strip()
-        cur_total = str(current.get("line_total_with_tax") or "").strip()
-
-        sug_name = str(item.get("suggested_item_name") or cur_name).strip()
-        sug_spec = str(item.get("suggested_spec") or cur_spec).strip()
-
-        confidence_raw = item.get("confidence")
-        try:
-            confidence_text = f"{float(confidence_raw) * 100:.1f}%"
-        except (TypeError, ValueError):
-            confidence_text = str(confidence_raw or "")
-        risk_text = "、".join(str(x) for x in (item.get("risk_types") or []) if str(x).strip())
-        reason_text = str(item.get("reason") or "").strip()
-
-        left_rows.append(
-            {
-                "行号": row_no,
-                "项目名称": cur_name,
-                "规格型号": cur_spec,
-                "数量": cur_quantity,
-                "单位": cur_unit,
-                "每项含税总价": cur_total,
-                "置信度": confidence_text,
-                "风险类型": risk_text,
-                "原因": reason_text,
-            }
-        )
-        right_rows.append(
-            {
-                "row_no": row_no,
-                "item_name": sug_name,
-                "spec": sug_spec,
-                "quantity": cur_quantity,
-                "unit": cur_unit,
-                "line_total_with_tax": cur_total,
-                "confidence_text": confidence_text,
-                "risk_types": risk_text,
-                "reason": reason_text,
-            }
-        )
-    return left_rows, right_rows
+    return material_usecase.build_review_compare_rows(fields)
 
 
 def _material_agent_apply_review_compare_edits(
@@ -3236,55 +2755,8 @@ def _material_agent_apply_review_compare_edits(
     fields: dict[str, Any],
     edited_rows: list[dict[str, Any]],
 ) -> tuple[bool, str]:
-    base_rows = _normalize_line_items(_to_editor_rows(fields.get("line_items")))
-    if not base_rows:
-        return False, "当前主表无可更新明细。"
-
-    changed = 0
-    for row in edited_rows:
-        if not isinstance(row, dict):
-            continue
-        try:
-            row_no = int(row.get("row_no") or 0)
-        except (TypeError, ValueError):
-            continue
-        if row_no <= 0 or row_no > len(base_rows):
-            continue
-        idx = row_no - 1
-        current = dict(base_rows[idx])
-
-        next_total = _format_amount(_safe_float(row.get("line_total_with_tax")))
-        if not next_total:
-            next_total = current.get("line_total_with_tax", "")
-
-        candidate = {
-            "item_name": str(row.get("item_name") or "").strip() or current.get("item_name", ""),
-            "spec": str(row.get("spec") or "").strip(),
-            "quantity": _normalize_quantity(row.get("quantity")),
-            "unit": str(row.get("unit") or "").strip(),
-            "line_total_with_tax": next_total,
-        }
-        if candidate != current:
-            base_rows[idx] = candidate
-            changed += 1
-
-    if changed <= 0:
-        # Keep explicit feedback so user sees button click has been handled.
-        return False, "已执行应用，但检测到右侧与主表无差异（或当前单元格未提交修改）。"
-
-    new_fields = dict(fields)
-    new_fields["auto_split_enabled"] = False
-    new_fields["line_items"] = base_rows
-    total = _line_items_total(base_rows)
-    if total is not None:
-        new_fields["amount"] = _format_amount(total)
-    # 用户在复核弹窗内确认后，清空低置信度队列。
-    new_fields["low_confidence_review"] = []
-
-    ok, err = _material_agent_apply_updates(task_id, new_fields)
-    if not ok:
-        return False, err or "保存失败。"
-    return True, f"已应用复核修改 {changed} 行，并写入学习案例。"
+    result = material_usecase.apply_review_compare_edits(task_id, fields, edited_rows)
+    return result.ok, result.message
 
 
 @st.dialog("质量风险复核（左原始 / 右LLM建议）", width="large")
@@ -3458,55 +2930,11 @@ def _material_agent_get_rule_llm_compare_rows(
 
 
 def _material_agent_build_rule_llm_compare_rows(fields: dict[str, Any]) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
-    rule_rows = _normalize_line_items(_to_editor_rows(fields.get("rule_line_items_baseline")))
-    llm_rows = _normalize_line_items(_to_editor_rows(fields.get("llm_line_items_suggested")))
-    if not llm_rows:
-        llm_rows = _normalize_line_items(_to_editor_rows(fields.get("line_items")))
-
-    total = max(len(rule_rows), len(llm_rows))
-    left_rows: list[dict[str, Any]] = []
-    right_rows: list[dict[str, Any]] = []
-    for idx in range(total):
-        row_no = idx + 1
-        rule = rule_rows[idx] if idx < len(rule_rows) else {}
-        llm = llm_rows[idx] if idx < len(llm_rows) else rule
-
-        left_rows.append(
-            {
-                "行号": row_no,
-                "项目名称": str(rule.get("item_name") or ""),
-                "规格型号": str(rule.get("spec") or ""),
-                "数量": str(rule.get("quantity") or ""),
-                "单位": str(rule.get("unit") or ""),
-                "每项含税总价": str(rule.get("line_total_with_tax") or ""),
-            }
-        )
-        right_rows.append(
-            {
-                "row_no": row_no,
-                "item_name": str(llm.get("item_name") or ""),
-                "spec": str(llm.get("spec") or ""),
-                "quantity": str(llm.get("quantity") or ""),
-                "unit": str(llm.get("unit") or ""),
-                "line_total_with_tax": str(llm.get("line_total_with_tax") or ""),
-            }
-        )
-    return left_rows, right_rows
+    return material_usecase.build_rule_llm_compare_rows(fields)
 
 
 def _material_agent_rule_llm_diff_count(fields: dict[str, Any]) -> int:
-    rule_rows = _normalize_line_items(_to_editor_rows(fields.get("rule_line_items_baseline")))
-    llm_rows = _normalize_line_items(_to_editor_rows(fields.get("llm_line_items_suggested")))
-    if not llm_rows:
-        llm_rows = _normalize_line_items(_to_editor_rows(fields.get("line_items")))
-    total = max(len(rule_rows), len(llm_rows))
-    changed = 0
-    for idx in range(total):
-        old = rule_rows[idx] if idx < len(rule_rows) else {}
-        new = llm_rows[idx] if idx < len(llm_rows) else {}
-        if old != new:
-            changed += 1
-    return changed
+    return material_usecase.rule_llm_diff_count(fields)
 
 
 def _material_agent_apply_rule_llm_compare_edits(
@@ -3514,34 +2942,8 @@ def _material_agent_apply_rule_llm_compare_edits(
     fields: dict[str, Any],
     edited_rows: list[dict[str, Any]],
 ) -> tuple[bool, str]:
-    normalized_rows = _normalize_line_items(_to_editor_rows(edited_rows))
-    if not normalized_rows:
-        return False, "右侧无可应用数据。"
-
-    current_rows = _normalize_line_items(_to_editor_rows(fields.get("line_items")))
-    changed = 0
-    total = max(len(current_rows), len(normalized_rows))
-    for idx in range(total):
-        old = current_rows[idx] if idx < len(current_rows) else {}
-        new = normalized_rows[idx] if idx < len(normalized_rows) else {}
-        if old != new:
-            changed += 1
-    if changed <= 0:
-        return True, "两表当前一致，无需应用。"
-
-    new_fields = dict(fields)
-    new_fields["auto_split_enabled"] = False
-    new_fields["line_items"] = normalized_rows
-    new_fields["llm_line_items_suggested"] = list(normalized_rows)
-    new_fields["low_confidence_review"] = []
-    total_amount = _line_items_total(normalized_rows)
-    if total_amount is not None:
-        new_fields["amount"] = _format_amount(total_amount)
-
-    ok, err = _material_agent_apply_updates(task_id, new_fields)
-    if not ok:
-        return False, err or "保存失败。"
-    return True, f"已应用规则/LLM对比结果，更新 {changed} 行，并写入学习案例。"
+    result = material_usecase.apply_rule_llm_compare_edits(task_id, fields, edited_rows)
+    return result.ok, result.message
 
 
 @st.dialog("智能修复对比（规则识别 vs LLM修复）", width="large")
@@ -4055,16 +3457,14 @@ def _material_agent_apply_actions_from_llm(
         return True, "已将LLM修复表应用到主表。", updated_task, updated_fields
 
     if first_action == "reidentify":
-        try:
-            local_runner.process_task(task.id)
-            local_runner.export_task(task.id, export_format="both")
-            updated_task = local_runner.get_task(task.id) or task
-            updated_fields = _material_agent_extract_fields(updated_task)
-            line_count = len(_normalize_line_items(_to_editor_rows(updated_fields.get("line_items"))))
-            _material_agent_record_change(task.id, "reidentify", [f"重新识别后共 {line_count} 行。"], user_text)
-            return True, f"已重新识别，当前识别到明细 {line_count} 行。", updated_task, updated_fields
-        except Exception as exc:
-            return True, f"重新识别失败：{exc}", task, fields
+        result = material_usecase.reprocess_and_export(task.id)
+        if not result.ok:
+            return True, f"重新识别失败：{result.message}", task, fields
+        updated_task = local_runner.get_task(task.id) or task
+        updated_fields = _material_agent_extract_fields(updated_task)
+        line_count = len(_normalize_line_items(_to_editor_rows(updated_fields.get("line_items"))))
+        _material_agent_record_change(task.id, "reidentify", [f"重新识别后共 {line_count} 行。"], user_text)
+        return True, f"已重新识别，当前识别到明细 {line_count} 行。", updated_task, updated_fields
 
     # Row-level actions (update/delete/add/batch_update)
     working_rows = [dict(row) for row in rows]
@@ -4214,15 +3614,13 @@ def _material_agent_apply_chat_command(
         return True, "已将LLM修复表应用到主表。", updated_task, updated_fields
 
     if "重新识别" in text:
-        try:
-            local_runner.process_task(task.id)
-            local_runner.export_task(task.id, export_format="both")
-            updated_task = local_runner.get_task(task.id) or task
-            updated_fields = _material_agent_extract_fields(updated_task)
-            line_count = len(_normalize_line_items(_to_editor_rows(updated_fields.get("line_items"))))
-            return True, f"已重新识别，当前识别到明细 {line_count} 行。", updated_task, updated_fields
-        except Exception as exc:
-            return True, f"重新识别失败：{exc}", task, fields
+        result = material_usecase.reprocess_and_export(task.id)
+        if not result.ok:
+            return True, f"重新识别失败：{result.message}", task, fields
+        updated_task = local_runner.get_task(task.id) or task
+        updated_fields = _material_agent_extract_fields(updated_task)
+        line_count = len(_normalize_line_items(_to_editor_rows(updated_fields.get("line_items"))))
+        return True, f"已重新识别，当前识别到明细 {line_count} 行。", updated_task, updated_fields
 
     rows = _normalize_line_items(_to_editor_rows(fields.get("line_items")))
     if not rows:
@@ -4466,28 +3864,15 @@ def _render_material_conversation_agent() -> None:
             st.warning("请先上传 PDF。")
         else:
             with st.spinner("正在识别材料发票，并执行 LLM 自动修复..."):
-                new_ids: list[str] = []
-                prepare_errors: list[str] = []
-                for file in upload_list:
-                    task = local_runner.create_and_process_task(
-                        file.name,
-                        file.getvalue(),
-                        auto_process=True,
-                        auto_export=True,
-                    )
-                    if task is not None:
-                        try:
-                            fields = _material_agent_extract_fields(task)
-                            _, _, prepared_task, _ = _material_agent_run_llm_fix(task, fields)
-                            task = prepared_task or task
-                        except Exception as exc:
-                            prepare_errors.append(f"{file.name}: {exc}")
-                        new_ids.append(task.id)
-                if new_ids:
-                    merged = list(dict.fromkeys(new_ids + task_ids))
+                process_result = material_usecase.process_uploaded_files(upload_list)
+                if process_result.task_ids:
+                    merged = list(dict.fromkeys(process_result.task_ids + task_ids))
                     st.session_state["material_agent_task_ids"] = merged
-            if prepare_errors:
-                st.warning("以下文件的自动 LLM 修复未完成，可稍后点“智能修复对比（规则 vs LLM）”补跑：\n\n- " + "\n- ".join(prepare_errors[:8]))
+            if process_result.prepare_errors:
+                st.warning(
+                    "以下文件的自动 LLM 修复未完成，可稍后点“智能修复对比（规则 vs LLM）”补跑：\n\n- "
+                    + "\n- ".join(process_result.prepare_errors[:8])
+                )
             st.success("材料费任务已更新。")
             st.rerun()
 

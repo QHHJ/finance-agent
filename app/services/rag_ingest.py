@@ -4,7 +4,7 @@ import hashlib
 import re
 from typing import Any
 
-from . import rag_store
+from app.retrieval.factory import get_retriever
 
 
 def _clean_text(text: str) -> str:
@@ -61,7 +61,8 @@ def sync_policy_document(policy: Any) -> int:
     policy_name = str(getattr(policy, "name", "") or "policy").strip()
     raw_text = str(getattr(policy, "raw_text", "") or "")
 
-    rag_store.delete_documents(source_type="policy", source_id=policy_id)
+    retriever = get_retriever()
+    retriever.delete_documents(source_type="policy", source_id=policy_id)
 
     chunks = chunk_text(raw_text)
     documents: list[dict[str, Any]] = []
@@ -85,8 +86,9 @@ def sync_policy_document(policy: Any) -> int:
 
     if not documents:
         return 0
-    return rag_store.upsert_documents(source_type="policy", source_id=policy_id, documents=documents)
+    return retriever.upsert_documents(source_type="policy", source_id=policy_id, documents=documents)
 
 
 def delete_policy_document(policy_id: int | str) -> int:
-    return rag_store.delete_documents(source_type="policy", source_id=str(policy_id))
+    retriever = get_retriever()
+    return retriever.delete_documents(source_type="policy", source_id=str(policy_id))

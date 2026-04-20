@@ -4,7 +4,7 @@ import os
 import re
 from typing import Any
 
-from . import rag_store
+from app.retrieval.factory import get_retriever
 
 
 def _top_k(default_value: int, env_key: str) -> int:
@@ -37,7 +37,8 @@ def _shorten(text: str, max_len: int = 220) -> str:
 
 
 def retrieve_policy_hits(query: str, top_k: int | None = None) -> list[dict[str, Any]]:
-    return rag_store.query_documents(
+    retriever = get_retriever()
+    return retriever.query_documents(
         query=query,
         source_types=["policy"],
         top_k=top_k or _top_k(4, "RAG_POLICY_TOP_K"),
@@ -46,7 +47,8 @@ def retrieve_policy_hits(query: str, top_k: int | None = None) -> list[dict[str,
 
 
 def retrieve_material_case_hits(query: str, top_k: int | None = None) -> list[dict[str, Any]]:
-    return rag_store.query_documents(
+    retriever = get_retriever()
+    return retriever.query_documents(
         query=query,
         source_types=["material_case"],
         top_k=top_k or _top_k(4, "RAG_MATERIAL_CASE_TOP_K"),
@@ -56,7 +58,8 @@ def retrieve_material_case_hits(query: str, top_k: int | None = None) -> list[di
 
 def retrieve_material_fix_case_hits(query: str, top_k: int | None = None) -> list[dict[str, Any]]:
     k = top_k or _top_k(4, "RAG_MATERIAL_FIX_CASE_TOP_K")
-    hits = rag_store.query_documents(
+    retriever = get_retriever()
+    hits = retriever.query_documents(
         query=query,
         source_types=["material_fix_case"],
         top_k=k,
@@ -69,7 +72,8 @@ def retrieve_material_fix_case_hits(query: str, top_k: int | None = None) -> lis
 
 
 def retrieve_travel_case_hits(query: str, top_k: int | None = None) -> list[dict[str, Any]]:
-    return rag_store.query_documents(
+    retriever = get_retriever()
+    return retriever.query_documents(
         query=query,
         source_types=["travel_case"],
         top_k=top_k or _top_k(4, "RAG_TRAVEL_CASE_TOP_K"),
