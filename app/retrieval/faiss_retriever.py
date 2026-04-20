@@ -2,10 +2,11 @@ from __future__ import annotations
 
 import json
 import os
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-from sqlalchemy import select
+from sqlalchemy import func, select
 
 from app.db import repo
 from app.db.models import RagVectorDocument
@@ -19,12 +20,17 @@ from app.services import rag_embedder
 class FaissRetriever(Retriever):
     def __init__(self, index_dir: Path | None = None) -> None:
         self._sqlite = SQLiteRetriever()
+        self._faiss = self._import_faiss_strict()
+        self._np = self._import_numpy_strict()
+
         self.index_dir = Path(index_dir or os.getenv("FAISS_INDEX_DIR", BASE_DIR / "data" / "faiss_index"))
         self.index_dir.mkdir(parents=True, exist_ok=True)
         self.index_path = self.index_dir / "rag_index.faiss"
         self.mapping_path = self.index_dir / "rag_index_mapping.json"
+
         self._index = None
         self._doc_ids: list[int] = []
+        self._db_snapshot: dict[str, Any] | None = None
 
     def upsert_documents(
         self,
@@ -73,6 +79,7 @@ class FaissRetriever(Retriever):
             return []
 
         if not self._ensure_index_loaded():
+            # Keep availability if index is temporarily unavailable.
             return self._sqlite.query_documents(
                 query=query_text,
                 source_types=source_types,
@@ -85,32 +92,143 @@ class FaissRetriever(Retriever):
         query_vec = rag_embedder.embed_text(query_text)
         if not query_vec:
             return []
+        if self._index is None or not self._doc_ids:
+            return []
+
+        total_docs = len(self._doc_ids)
+        query_arr = self._np.asarray([query_vec], dtype="float32")
+        candidate_k = min(max(top_k * 20, 200), total_docs)
+
+        # For source_types / metadata_filter, do one expanded search if needed.
+        for pass_id in range(2):
+            id_to_score = self._collect_candidates(query_arr, candidate_k)
+            if not id_to_score:
+                return []
+
+            hits, fallback_hits = self._load_ranked_hits(
+                id_to_score=id_to_score,
+                source_types=source_types,
+                min_score=min_score,
+                metadata_filter=metadata_filter,
+            )
+            if hits:
+                return hits[: max(1, top_k)]
+            if fallback_hits:
+                return fallback_hits[: max(1, top_k)]
+
+            if pass_id == 0 and candidate_k < total_docs:
+                candidate_k = total_docs
+                continue
+            break
+
+        return []
+
+    def rebuild_index(self) -> int:
+        limit = max(1000, int(os.getenv("FAISS_REBUILD_SCAN_LIMIT", "200000")))
+        db = SessionLocal()
+        try:
+            docs = repo.list_rag_documents(db, source_types=None, limit=limit)
+            db_snapshot = self._build_db_snapshot(db)
+        finally:
+            db.close()
+
+        vectors: list[list[float]] = []
+        doc_ids: list[int] = []
+        dim = 0
+        for doc in docs:
+            emb = list(getattr(doc, "embedding", []) or [])
+            if not emb:
+                continue
+            emb = [float(v) for v in emb]
+            if not emb:
+                continue
+            if dim == 0:
+                dim = len(emb)
+            if len(emb) != dim:
+                continue
+            vectors.append(emb)
+            doc_ids.append(int(doc.id))
+
+        if not vectors:
+            self._index = None
+            self._doc_ids = []
+            self._db_snapshot = db_snapshot
+            if self.index_path.exists():
+                self.index_path.unlink()
+            self._write_mapping(
+                {
+                    "doc_ids": [],
+                    "db_snapshot": db_snapshot,
+                    "dim": 0,
+                    "index_type": "IndexFlatIP",
+                    "built_at": datetime.utcnow().isoformat(),
+                }
+            )
+            return 0
+
+        matrix = self._np.asarray(vectors, dtype="float32")
+        index = self._faiss.IndexFlatIP(dim)
+        index.add(matrix)
+        self._faiss.write_index(index, str(self.index_path))
+        self._write_mapping(
+            {
+                "doc_ids": doc_ids,
+                "db_snapshot": db_snapshot,
+                "dim": dim,
+                "index_type": "IndexFlatIP",
+                "built_at": datetime.utcnow().isoformat(),
+            }
+        )
+
+        self._index = index
+        self._doc_ids = doc_ids
+        self._db_snapshot = db_snapshot
+        return len(doc_ids)
+
+    def _ensure_index_loaded(self) -> bool:
+        current_snapshot = self._current_db_snapshot()
+
+        if self._index is not None and self._doc_ids and self._db_snapshot == current_snapshot:
+            return True
+
+        if not self.index_path.exists() or not self.mapping_path.exists():
+            if int(current_snapshot.get("doc_count", 0)) <= 0:
+                self._index = None
+                self._doc_ids = []
+                self._db_snapshot = current_snapshot
+                return False
+            return self.rebuild_index() > 0
+
+        payload = self._read_mapping()
+        mapped_doc_ids = [int(x) for x in list(payload.get("doc_ids") or [])]
+        mapped_snapshot = dict(payload.get("db_snapshot") or {})
+
+        if mapped_snapshot != current_snapshot:
+            return self.rebuild_index() > 0
+
+        if not mapped_doc_ids:
+            self._index = None
+            self._doc_ids = []
+            self._db_snapshot = current_snapshot
+            return False
 
         try:
-            import numpy as np
+            index = self._faiss.read_index(str(self.index_path))
         except Exception:
-            return self._sqlite.query_documents(
-                query=query_text,
-                source_types=source_types,
-                top_k=top_k,
-                min_score=min_score,
-                limit_scan=limit_scan,
-                metadata_filter=metadata_filter,
-            )
+            return self.rebuild_index() > 0
 
-        if self._index is None or not self._doc_ids:
-            return self._sqlite.query_documents(
-                query=query_text,
-                source_types=source_types,
-                top_k=top_k,
-                min_score=min_score,
-                limit_scan=limit_scan,
-                metadata_filter=metadata_filter,
-            )
+        if int(index.ntotal) != len(mapped_doc_ids):
+            return self.rebuild_index() > 0
 
-        candidate_k = min(max(20, top_k * 8), len(self._doc_ids))
-        query_arr = np.asarray([query_vec], dtype="float32")
-        scores, positions = self._index.search(query_arr, candidate_k)
+        self._index = index
+        self._doc_ids = mapped_doc_ids
+        self._db_snapshot = current_snapshot
+        return True
+
+    def _collect_candidates(self, query_arr, top_k: int) -> dict[int, float]:
+        if self._index is None or not self._doc_ids or top_k <= 0:
+            return {}
+        scores, positions = self._index.search(query_arr, top_k)
         score_row = scores[0].tolist() if len(scores) else []
         pos_row = positions[0].tolist() if len(positions) else []
 
@@ -122,9 +240,18 @@ class FaissRetriever(Retriever):
             prev = id_to_score.get(doc_id)
             if prev is None or score > prev:
                 id_to_score[doc_id] = float(score)
+        return id_to_score
 
+    def _load_ranked_hits(
+        self,
+        *,
+        id_to_score: dict[int, float],
+        source_types: list[str],
+        min_score: float,
+        metadata_filter: dict[str, Any] | None,
+    ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
         if not id_to_score:
-            return []
+            return [], []
 
         db = SessionLocal()
         try:
@@ -159,90 +286,44 @@ class FaissRetriever(Retriever):
                 hits.append(item)
 
         hits.sort(key=lambda item: item["score"], reverse=True)
-        if hits:
-            return hits[: max(1, top_k)]
-
         fallback_hits.sort(key=lambda item: item["score"], reverse=True)
-        return fallback_hits[: max(1, top_k)]
+        return hits, fallback_hits
 
-    def rebuild_index(self) -> int:
-        faiss = self._import_faiss()
-        if faiss is None:
-            return 0
-
-        try:
-            import numpy as np
-        except Exception:
-            return 0
-
-        limit = max(1000, int(os.getenv("FAISS_REBUILD_SCAN_LIMIT", "200000")))
+    def _current_db_snapshot(self) -> dict[str, Any]:
         db = SessionLocal()
         try:
-            docs = repo.list_rag_documents(db, source_types=None, limit=limit)
+            return self._build_db_snapshot(db)
         finally:
             db.close()
 
-        vectors: list[list[float]] = []
-        doc_ids: list[int] = []
-        dim = 0
-        for doc in docs:
-            emb = list(getattr(doc, "embedding", []) or [])
-            if not emb:
-                continue
-            emb = [float(v) for v in emb]
-            if not emb:
-                continue
-            if dim == 0:
-                dim = len(emb)
-            if len(emb) != dim:
-                continue
-            vectors.append(emb)
-            doc_ids.append(int(doc.id))
+    @staticmethod
+    def _build_db_snapshot(db) -> dict[str, Any]:
+        row = db.execute(
+            select(
+                func.count(RagVectorDocument.id),
+                func.max(RagVectorDocument.id),
+                func.max(RagVectorDocument.updated_at),
+            )
+        ).one()
+        count = int(row[0] or 0)
+        max_id = int(row[1] or 0) if row[1] is not None else 0
+        max_updated = row[2].isoformat() if row[2] is not None else ""
+        return {"doc_count": count, "max_doc_id": max_id, "max_updated_at": max_updated}
 
-        if not vectors:
-            self._index = None
-            self._doc_ids = []
-            if self.index_path.exists():
-                self.index_path.unlink()
-            self.mapping_path.write_text(json.dumps({"doc_ids": []}, ensure_ascii=False), encoding="utf-8")
-            return 0
-
-        matrix = np.asarray(vectors, dtype="float32")
-        index = faiss.IndexFlatIP(dim)
-        index.add(matrix)
-        faiss.write_index(index, str(self.index_path))
-        self.mapping_path.write_text(json.dumps({"doc_ids": doc_ids}, ensure_ascii=False), encoding="utf-8")
-
-        self._index = index
-        self._doc_ids = doc_ids
-        return len(doc_ids)
-
-    def _ensure_index_loaded(self) -> bool:
-        faiss = self._import_faiss()
-        if faiss is None:
-            return False
-
-        if self._index is not None and self._doc_ids:
-            return True
-
-        if not self.index_path.exists() or not self.mapping_path.exists():
-            return self.rebuild_index() > 0
-
+    def _read_mapping(self) -> dict[str, Any]:
         try:
             payload = json.loads(self.mapping_path.read_text(encoding="utf-8"))
-            doc_ids = [int(x) for x in list(payload.get("doc_ids") or [])]
-            if not doc_ids:
-                self._index = None
-                self._doc_ids = []
-                return False
-            index = faiss.read_index(str(self.index_path))
-            if int(index.ntotal) != len(doc_ids):
-                return self.rebuild_index() > 0
-            self._index = index
-            self._doc_ids = doc_ids
-            return True
+            if isinstance(payload, dict):
+                return payload
         except Exception:
-            return self.rebuild_index() > 0
+            pass
+        return {}
+
+    def _write_mapping(self, payload: dict[str, Any]) -> None:
+        self.mapping_path.write_text(
+            json.dumps(payload, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
 
     @staticmethod
     def _metadata_match(metadata_json: dict[str, Any], metadata_filter: dict[str, Any] | None) -> bool:
@@ -254,11 +335,24 @@ class FaissRetriever(Retriever):
         return True
 
     @staticmethod
-    def _import_faiss():
+    def _import_faiss_strict():
         try:
             import faiss
 
             return faiss
-        except Exception:
-            return None
+        except Exception as exc:
+            raise RuntimeError(
+                "FAISS backend is enabled but faiss is not available. "
+                "Install dependency: pip install faiss-cpu"
+            ) from exc
 
+    @staticmethod
+    def _import_numpy_strict():
+        try:
+            import numpy as np
+
+            return np
+        except Exception as exc:
+            raise RuntimeError(
+                "FAISS backend requires numpy. Install dependency: pip install numpy"
+            ) from exc

@@ -6,7 +6,8 @@ from io import BytesIO
 from pathlib import Path
 from typing import Any, Callable
 
-from app.services import learning
+from app.services import learning, rag_retriever
+from app.usecases import task_orchestration as task_ops
 
 from .dto import OperationResult, TravelStatus
 
@@ -340,3 +341,11 @@ def learn_from_profiles(profiles: list[dict[str, Any]], assignment: dict[str, An
         return OperationResult(ok=True)
     except Exception as exc:
         return OperationResult(ok=False, message=str(exc))
+
+
+def list_policies(limit: int = 200):
+    return task_ops.list_policies(limit=limit)
+
+
+def build_travel_policy_context(raw_text: str, top_k: int = 3) -> str:
+    return rag_retriever.build_travel_policy_context(raw_text, top_k=top_k)

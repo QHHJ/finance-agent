@@ -3,7 +3,9 @@ from __future__ import annotations
 import re
 from typing import Any
 
-from app.services import extractor, local_runner, material_fix_agent
+from app.runtime import init_runtime
+from app.services import extractor, material_fix_agent, rag_retriever
+from app.usecases import task_orchestration as task_ops
 
 from .dto import MaterialBatchProcessResult, OperationResult
 
@@ -207,8 +209,8 @@ def apply_updates(task_id: str, fields: dict[str, Any]) -> OperationResult:
             "extracted_fields": build_fields_payload(fields),
         }
         # apply_corrections 内部包含 learn_from_material_task 回写
-        local_runner.apply_corrections(task_id, corrections)
-        local_runner.export_task(task_id, export_format="both")
+        task_ops.apply_corrections(task_id, corrections)
+        task_ops.export_task(task_id, export_format="both")
         return OperationResult(ok=True)
     except Exception as exc:
         return OperationResult(ok=False, message=str(exc))
@@ -267,7 +269,7 @@ def run_llm_fix(task: Any, fields: dict[str, Any]) -> tuple[bool, str, Any, dict
     if not save_result.ok:
         return True, f"LLM修复结果保存失败：{save_result.message}", task, fields
 
-    updated_task = local_runner.get_task(task.id) or task
+    updated_task = task_ops.get_task(task.id) or task
     updated_fields = extract_fields(updated_task)
     summary = (
         f"LLM可疑行分析完成：疑似 {llm_stats.get('suspicious_rows', 0)} 行，"
@@ -481,7 +483,7 @@ def apply_rule_llm_compare_edits(
 def process_uploaded_files(uploaded_files: list[Any]) -> MaterialBatchProcessResult:
     result = MaterialBatchProcessResult()
     for file in uploaded_files:
-        task = local_runner.create_and_process_task(
+        task = task_ops.create_and_process_task(
             file.name,
             file.getvalue(),
             auto_process=True,
@@ -501,8 +503,28 @@ def process_uploaded_files(uploaded_files: list[Any]) -> MaterialBatchProcessRes
 
 def reprocess_and_export(task_id: str) -> OperationResult:
     try:
-        local_runner.process_task(task_id)
-        local_runner.export_task(task_id, export_format="both")
+        task_ops.process_task(task_id)
+        task_ops.export_task(task_id, export_format="both")
         return OperationResult(ok=True)
     except Exception as exc:
         return OperationResult(ok=False, message=str(exc))
+
+
+def init_app_runtime() -> None:
+    init_runtime()
+
+
+def get_task(task_id: str):
+    return task_ops.get_task(task_id)
+
+
+def list_policies(limit: int = 200):
+    return task_ops.list_policies(limit=limit)
+
+
+def extract_invoice_fields(raw_text: str, pdf_path: str | None = None) -> dict[str, Any]:
+    return extractor.extract_invoice_fields(raw_text, pdf_path=pdf_path)
+
+
+def build_material_references(fields: dict[str, Any], raw_text: str) -> dict[str, Any]:
+    return rag_retriever.build_material_references(fields, raw_text)

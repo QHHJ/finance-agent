@@ -13,8 +13,7 @@ import requests
 import streamlit as st
 from pypdf import PdfReader
 
-from app.runtime import init_runtime
-from app.services import extractor, local_runner, rag_retriever
+from app.usecases import dto as usecase_dto
 from app.usecases import material_agent as material_usecase
 from app.usecases import travel_agent as travel_usecase
 
@@ -385,7 +384,7 @@ def _extract_travel_retrieval_terms(raw_text: str) -> list[str]:
 def _load_travel_policy_corpus() -> list[dict[str, str]]:
     corpus: list[dict[str, str]] = []
     try:
-        policies = local_runner.list_policies(limit=200)
+        policies = travel_usecase.list_policies(limit=200)
     except Exception:
         return corpus
 
@@ -418,7 +417,7 @@ def _policy_snippet_around_terms(text: str, terms: list[str], max_chars: int = 4
 
 def _build_travel_rag_context(raw_text: str) -> str:
     try:
-        context = rag_retriever.build_travel_policy_context(raw_text, top_k=3)
+        context = travel_usecase.build_travel_policy_context(raw_text, top_k=3)
         if context:
             return context
     except Exception:
@@ -692,7 +691,7 @@ def _auto_extract_amount_from_ticket(uploaded_file) -> float | None:
                 if no_tax_total is not None and tax_total is not None:
                     return float(no_tax_total + tax_total)
 
-            extracted = extractor.extract_invoice_fields(raw_text)
+            extracted = material_usecase.extract_invoice_fields(raw_text)
             amount = _safe_float(extracted.get("amount"))
             tax_amount = _safe_float(extracted.get("tax_amount"))
             if amount is not None and tax_amount is not None:
@@ -1427,7 +1426,7 @@ def _infer_doc_type_from_invoice_fields(raw_text: str) -> str:
     if not text:
         return "unknown"
     try:
-        fields = extractor.extract_invoice_fields(text)
+        fields = material_usecase.extract_invoice_fields(text)
     except Exception:
         return "unknown"
 
@@ -2099,7 +2098,7 @@ def _generate_travel_agent_reply_llm(
     rag_context = ""
     try:
         rag_query = f"{user_text}\n{context_text[:1200]}"
-        rag_context = rag_retriever.build_travel_policy_context(rag_query, top_k=3)
+        rag_context = travel_usecase.build_travel_policy_context(rag_query, top_k=3)
     except Exception:
         rag_context = ""
 
@@ -2650,7 +2649,7 @@ def _material_agent_build_fields_payload(fields: dict[str, Any]) -> dict[str, An
 
 
 def _material_agent_apply_updates(task_id: str, fields: dict[str, Any]) -> tuple[bool, str]:
-    result = material_usecase.apply_updates(task_id, fields)
+    result: usecase_dto.OperationResult = material_usecase.apply_updates(task_id, fields)
     return result.ok, result.message
 
 
@@ -2755,13 +2754,13 @@ def _material_agent_apply_review_compare_edits(
     fields: dict[str, Any],
     edited_rows: list[dict[str, Any]],
 ) -> tuple[bool, str]:
-    result = material_usecase.apply_review_compare_edits(task_id, fields, edited_rows)
+    result: usecase_dto.OperationResult = material_usecase.apply_review_compare_edits(task_id, fields, edited_rows)
     return result.ok, result.message
 
 
 @st.dialog("质量风险复核（左原始 / 右LLM建议）", width="large")
 def _render_material_review_dialog(task_id: str) -> None:
-    task = local_runner.get_task(task_id)
+    task = material_usecase.get_task(task_id)
     if task is None:
         st.error("任务不存在，无法复核。")
         return
@@ -2942,13 +2941,13 @@ def _material_agent_apply_rule_llm_compare_edits(
     fields: dict[str, Any],
     edited_rows: list[dict[str, Any]],
 ) -> tuple[bool, str]:
-    result = material_usecase.apply_rule_llm_compare_edits(task_id, fields, edited_rows)
+    result: usecase_dto.OperationResult = material_usecase.apply_rule_llm_compare_edits(task_id, fields, edited_rows)
     return result.ok, result.message
 
 
 @st.dialog("智能修复对比（规则识别 vs LLM修复）", width="large")
 def _render_material_rule_llm_compare_dialog(task_id: str) -> None:
-    task = local_runner.get_task(task_id)
+    task = material_usecase.get_task(task_id)
     if task is None:
         st.error("任务不存在。")
         return
@@ -3429,7 +3428,7 @@ def _material_agent_apply_actions_from_llm(
         ok, err = _material_agent_apply_updates(task.id, new_fields)
         if not ok:
             return True, f"撤销失败：{err}", task, fields
-        updated_task = local_runner.get_task(task.id) or task
+        updated_task = material_usecase.get_task(task.id) or task
         updated_fields = _material_agent_extract_fields(updated_task)
         _material_agent_record_change(task.id, "undo_last", ["已回滚到上一步。"], user_text)
         return True, "已撤销上一步修改。", updated_task, updated_fields
@@ -3450,7 +3449,7 @@ def _material_agent_apply_actions_from_llm(
         ok, err = _material_agent_apply_updates(task.id, new_fields)
         if not ok:
             return True, f"应用LLM修复表失败：{err}", task, fields
-        updated_task = local_runner.get_task(task.id) or task
+        updated_task = material_usecase.get_task(task.id) or task
         updated_fields = _material_agent_extract_fields(updated_task)
         diff_lines = _material_agent_build_row_diff(rows, llm_rows)
         _material_agent_record_change(task.id, "apply_compare", diff_lines or ["已应用LLM修复表。"], user_text)
@@ -3460,7 +3459,7 @@ def _material_agent_apply_actions_from_llm(
         result = material_usecase.reprocess_and_export(task.id)
         if not result.ok:
             return True, f"重新识别失败：{result.message}", task, fields
-        updated_task = local_runner.get_task(task.id) or task
+        updated_task = material_usecase.get_task(task.id) or task
         updated_fields = _material_agent_extract_fields(updated_task)
         line_count = len(_normalize_line_items(_to_editor_rows(updated_fields.get("line_items"))))
         _material_agent_record_change(task.id, "reidentify", [f"重新识别后共 {line_count} 行。"], user_text)
@@ -3543,7 +3542,7 @@ def _material_agent_apply_actions_from_llm(
     if not ok:
         return True, f"执行失败：{err}", task, fields
 
-    updated_task = local_runner.get_task(task.id) or task
+    updated_task = material_usecase.get_task(task.id) or task
     updated_fields = _material_agent_extract_fields(updated_task)
     diff_lines = _material_agent_build_row_diff(rows, new_rows)
     _material_agent_record_change(task.id, first_action, diff_lines or summaries or ["已应用修改。"], user_text)
@@ -3586,7 +3585,7 @@ def _material_agent_apply_chat_command(
         ok, err = _material_agent_apply_updates(task.id, new_fields)
         if not ok:
             return True, f"撤销失败：{err}", task, fields
-        updated_task = local_runner.get_task(task.id) or task
+        updated_task = material_usecase.get_task(task.id) or task
         updated_fields = _material_agent_extract_fields(updated_task)
         _material_agent_record_change(task.id, "undo_last", ["已回滚到上一步。"], text)
         return True, "已撤销上一步修改。", updated_task, updated_fields
@@ -3608,7 +3607,7 @@ def _material_agent_apply_chat_command(
         ok, err = _material_agent_apply_updates(task.id, new_fields)
         if not ok:
             return True, f"应用LLM修复表失败：{err}", task, fields
-        updated_task = local_runner.get_task(task.id) or task
+        updated_task = material_usecase.get_task(task.id) or task
         updated_fields = _material_agent_extract_fields(updated_task)
         _material_agent_record_change(task.id, "apply_compare", _material_agent_build_row_diff(old_rows, llm_rows), text)
         return True, "已将LLM修复表应用到主表。", updated_task, updated_fields
@@ -3617,7 +3616,7 @@ def _material_agent_apply_chat_command(
         result = material_usecase.reprocess_and_export(task.id)
         if not result.ok:
             return True, f"重新识别失败：{result.message}", task, fields
-        updated_task = local_runner.get_task(task.id) or task
+        updated_task = material_usecase.get_task(task.id) or task
         updated_fields = _material_agent_extract_fields(updated_task)
         line_count = len(_normalize_line_items(_to_editor_rows(updated_fields.get("line_items"))))
         return True, f"已重新识别，当前识别到明细 {line_count} 行。", updated_task, updated_fields
@@ -3640,7 +3639,7 @@ def _material_agent_apply_chat_command(
         ok, err = _material_agent_apply_updates(task.id, new_fields)
         if not ok:
             return True, f"删除失败：{err}", task, fields
-        updated_task = local_runner.get_task(task.id) or task
+        updated_task = material_usecase.get_task(task.id) or task
         updated_fields = _material_agent_extract_fields(updated_task)
         return True, f"已删除第{idx + 1}行：{removed.get('item_name', '')}。", updated_task, updated_fields
 
@@ -3678,7 +3677,7 @@ def _material_agent_apply_chat_command(
         ok, err = _material_agent_apply_updates(task.id, new_fields)
         if not ok:
             return True, f"新增失败：{err}", task, fields
-        updated_task = local_runner.get_task(task.id) or task
+        updated_task = material_usecase.get_task(task.id) or task
         updated_fields = _material_agent_extract_fields(updated_task)
         return True, "已新增1行并保存。", updated_task, updated_fields
 
@@ -3700,7 +3699,7 @@ def _material_agent_apply_chat_command(
         ok, err = _material_agent_apply_updates(task.id, new_fields)
         if not ok:
             return True, f"更新失败：{err}", task, fields
-        updated_task = local_runner.get_task(task.id) or task
+        updated_task = material_usecase.get_task(task.id) or task
         updated_fields = _material_agent_extract_fields(updated_task)
         changed_fields = []
         if "item_name" in row_updates:
@@ -3743,7 +3742,7 @@ def _generate_material_agent_reply_llm(
     hints = _material_agent_quality_hints(fields)
     raw_text = str(getattr(task, "raw_text", "") or "")
 
-    rag_bundle = rag_retriever.build_material_references(fields, raw_text)
+    rag_bundle = material_usecase.build_material_references(fields, raw_text)
     policy_refs = list(rag_bundle.get("policy_refs") or [])
     case_hits = list(rag_bundle.get("case_hits") or [])
     case_lines = []
@@ -3864,7 +3863,7 @@ def _render_material_conversation_agent() -> None:
             st.warning("请先上传 PDF。")
         else:
             with st.spinner("正在识别材料发票，并执行 LLM 自动修复..."):
-                process_result = material_usecase.process_uploaded_files(upload_list)
+                process_result: usecase_dto.MaterialBatchProcessResult = material_usecase.process_uploaded_files(upload_list)
                 if process_result.task_ids:
                     merged = list(dict.fromkeys(process_result.task_ids + task_ids))
                     st.session_state["material_agent_task_ids"] = merged
@@ -3878,7 +3877,7 @@ def _render_material_conversation_agent() -> None:
 
     valid_tasks = []
     for task_id in st.session_state.get("material_agent_task_ids", []):
-        task = local_runner.get_task(task_id)
+        task = material_usecase.get_task(task_id)
         if task is not None:
             valid_tasks.append(task)
     st.session_state["material_agent_task_ids"] = [task.id for task in valid_tasks]
@@ -3890,7 +3889,7 @@ def _render_material_conversation_agent() -> None:
     options = {f"{task.original_filename} | {task.id} | {task.status}": task.id for task in valid_tasks}
     selected_label = st.selectbox("选择当前材料任务", options=list(options.keys()), key="material_agent_selected_task")
     selected_task_id = options[selected_label]
-    task = local_runner.get_task(selected_task_id)
+    task = material_usecase.get_task(selected_task_id)
     if task is None:
         st.error("任务不存在。")
         return
@@ -3975,7 +3974,7 @@ def _render_material_conversation_agent() -> None:
     st.dataframe(display_rows_cn, use_container_width=True, hide_index=True)
 
     if st.button("智能修复对比（规则 vs LLM）", use_container_width=True, key=f"material_agent_llm_compare_{task.id}"):
-        latest_task = local_runner.get_task(task.id) or task
+        latest_task = material_usecase.get_task(task.id) or task
         latest_fields = _material_agent_extract_fields(latest_task)
         baseline_rows = _normalize_line_items(_to_editor_rows(latest_fields.get("rule_line_items_baseline")))
         llm_rows = _normalize_line_items(_to_editor_rows(latest_fields.get("llm_line_items_suggested")))
@@ -4071,7 +4070,7 @@ def main() -> None:
     st.title("财务 Agent（本地工具版）")
     st.caption("按费用类型选择流程：材料费 / 差旅费")
 
-    init_runtime()
+    material_usecase.init_app_runtime()
     _render_model_runtime_panel()
 
     flow_mode = st.radio(
@@ -4089,4 +4088,5 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
 
