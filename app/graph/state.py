@@ -14,8 +14,14 @@ class FinanceGraphState(TypedDict, total=False):
     final_data: dict[str, Any]
 
     task_type: str
+    next_action: str
+    needs_policy: bool
+    confidence: float | None
     review_items: list[dict[str, Any]]
     material_fix_result: dict[str, Any]
+    repaired_data: dict[str, Any]
     travel_context: dict[str, Any]
+    policy_context: str
+    agent_trace: list[dict[str, Any]]
     route_reason: str
     llm_error: str | None

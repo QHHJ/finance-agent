@@ -349,3 +349,15 @@ def list_policies(limit: int = 200):
 
 def build_travel_policy_context(raw_text: str, top_k: int = 3) -> str:
     return rag_retriever.build_travel_policy_context(raw_text, top_k=top_k)
+
+
+def retrieve_travel_case_hits(
+    query: str,
+    top_k: int = 4,
+    metadata_filter: dict[str, Any] | None = None,
+) -> list[dict[str, Any]]:
+    return rag_retriever.retrieve_travel_case_hits(
+        query=query,
+        top_k=top_k,
+        metadata_filter=metadata_filter,
+    )

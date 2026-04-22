@@ -1,6 +1,7 @@
 ﻿from __future__ import annotations
 
 import base64
+import hashlib
 import json
 from io import BytesIO
 import os
@@ -8,11 +9,13 @@ from pathlib import Path
 import re
 from typing import Any
 from datetime import datetime
+from uuid import uuid4
 
 import requests
 import streamlit as st
 from pypdf import PdfReader
 
+from app.ui import home_router
 from app.usecases import dto as usecase_dto
 from app.usecases import material_agent as material_usecase
 from app.usecases import travel_agent as travel_usecase
@@ -61,6 +64,398 @@ CHINESE_NUM_MAP = {
     "九": 9,
     "十": 10,
 }
+
+
+def _parse_json_object_loose(text: str) -> dict[str, Any] | None:
+    source = str(text or "").strip()
+    if not source:
+        return None
+    try:
+        parsed = json.loads(source)
+        return parsed if isinstance(parsed, dict) else None
+    except Exception:
+        pass
+    match = re.search(r"\{[\s\S]*\}", source)
+    if not match:
+        return None
+    try:
+        parsed = json.loads(match.group(0))
+        return parsed if isinstance(parsed, dict) else None
+    except Exception:
+        return None
+
+
+def _pending_actions_key(scope: str) -> str:
+    return f"{scope}_pending_actions"
+
+
+def _last_action_key(scope: str) -> str:
+    return f"{scope}_last_applied_action"
+
+
+def _get_pending_actions(scope: str) -> list[dict[str, Any]]:
+    key = _pending_actions_key(scope)
+    actions = st.session_state.setdefault(key, [])
+    if not isinstance(actions, list):
+        actions = []
+        st.session_state[key] = actions
+    normalized: list[dict[str, Any]] = []
+    changed = False
+    for item in actions:
+        if not isinstance(item, dict):
+            changed = True
+            continue
+        normalized.append(
+            {
+                "action_id": str(item.get("action_id") or uuid4().hex),
+                "action_type": str(item.get("action_type") or ""),
+                "summary": str(item.get("summary") or ""),
+                "target": str(item.get("target") or ""),
+                "risk_level": str(item.get("risk_level") or "medium"),
+                "status": str(item.get("status") or "pending"),
+                "payload": dict(item.get("payload") or {}),
+                "created_at": str(item.get("created_at") or ""),
+            }
+        )
+    if changed or normalized != actions:
+        st.session_state[key] = normalized
+    return normalized
+
+
+def _set_pending_actions(scope: str, actions: list[dict[str, Any]]) -> None:
+    st.session_state[_pending_actions_key(scope)] = [dict(item) for item in actions if isinstance(item, dict)]
+
+
+def _append_pending_action(
+    scope: str,
+    *,
+    action_type: str,
+    summary: str,
+    target: str = "",
+    risk_level: str = "medium",
+    payload: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    actions = _get_pending_actions(scope)
+    action = usecase_dto.PendingAction(
+        action_id=uuid4().hex,
+        action_type=str(action_type or "").strip(),
+        summary=str(summary or "").strip(),
+        target=str(target or "").strip(),
+        risk_level=str(risk_level or "medium"),
+        status="pending",
+        payload=dict(payload or {}),
+        created_at=datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+    ).to_dict()
+    actions.append(action)
+    _set_pending_actions(scope, actions)
+    return action
+
+
+def _update_pending_action(scope: str, action_id: str, patch: dict[str, Any]) -> dict[str, Any] | None:
+    target = str(action_id or "").strip()
+    if not target:
+        return None
+    actions = _get_pending_actions(scope)
+    updated = None
+    for item in actions:
+        if str(item.get("action_id") or "") != target:
+            continue
+        item.update(dict(patch or {}))
+        updated = item
+        break
+    _set_pending_actions(scope, actions)
+    return updated
+
+
+def _remove_pending_action(scope: str, action_id: str) -> bool:
+    target = str(action_id or "").strip()
+    if not target:
+        return False
+    actions = _get_pending_actions(scope)
+    filtered = [item for item in actions if str(item.get("action_id") or "") != target]
+    changed = len(filtered) != len(actions)
+    if changed:
+        _set_pending_actions(scope, filtered)
+    return changed
+
+
+def _clear_pending_actions(scope: str) -> None:
+    _set_pending_actions(scope, [])
+
+
+def _record_last_applied_action(scope: str, action: dict[str, Any]) -> None:
+    entry = usecase_dto.LastAppliedAction(
+        action_id=str(action.get("action_id") or uuid4().hex),
+        action_type=str(action.get("action_type") or ""),
+        summary=str(action.get("summary") or ""),
+        scope=scope,
+        applied_at=datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+    ).to_dict()
+    st.session_state[_last_action_key(scope)] = entry
+
+
+def _get_last_applied_action(scope: str) -> dict[str, Any] | None:
+    value = st.session_state.get(_last_action_key(scope))
+    return dict(value) if isinstance(value, dict) else None
+
+
+def _clear_last_applied_action(scope: str) -> None:
+    st.session_state.pop(_last_action_key(scope), None)
+
+
+def _compose_three_stage_reply(understand: str, status_change: str, next_step: str) -> str:
+    part1 = str(understand or "好的，我理解了。").strip()
+    part2 = str(status_change or "当前状态保持不变。").strip()
+    part3 = str(next_step or "你可以继续告诉我希望我怎么处理。").strip()
+    return f"{part1}\n\n{part2}\n\n{part3}"
+
+
+def _inject_ui_styles() -> None:
+    st.markdown(
+        """
+<style>
+/* Chat input: make boundary obvious and consistent */
+div[data-testid="stChatInput"] {
+  border: 1.5px solid #c7d2fe !important;
+  border-radius: 14px !important;
+  background: #ffffff !important;
+  box-shadow: 0 1px 2px rgba(15, 23, 42, 0.06) !important;
+  padding: 4px 8px !important;
+  margin-top: 6px !important;
+}
+
+div[data-testid="stChatInput"]:focus-within {
+  border-color: #2563eb !important;
+  box-shadow: 0 0 0 3px rgba(37, 99, 235, 0.16) !important;
+}
+
+div[data-testid="stChatInput"] textarea,
+div[data-testid="stChatInput"] input {
+  background: #ffffff !important;
+  color: #0f172a !important;
+}
+
+div[data-testid="stChatInput"] textarea::placeholder,
+div[data-testid="stChatInput"] input::placeholder {
+  color: #6b7280 !important;
+  opacity: 1 !important;
+}
+
+/* Generic input field visibility (for fallback text boxes) */
+div[data-testid="stTextInput"] input,
+div[data-testid="stTextArea"] textarea {
+  border: 1px solid #cbd5e1 !important;
+  border-radius: 10px !important;
+  background: #ffffff !important;
+}
+
+div[data-testid="stTextInput"] input:focus,
+div[data-testid="stTextArea"] textarea:focus {
+  border-color: #2563eb !important;
+  box-shadow: 0 0 0 3px rgba(37, 99, 235, 0.14) !important;
+}
+</style>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
+def _infer_intent_with_llm(message: str, domain: str) -> usecase_dto.IntentParseResult | None:
+    text = str(message or "").strip()
+    if not text:
+        return None
+    base_url = os.getenv("OLLAMA_BASE_URL", "http://127.0.0.1:11434").rstrip("/")
+    model = _chat_model()
+    prompt = (
+        "你是意图分类器。仅返回JSON对象，不要输出其他内容。"
+        "intent_type 只能是: chat, light_edit, strong_action, ambiguous。"
+        "risk_level 只能是: low, medium, high。"
+        "needs_confirmation 为布尔值。"
+        "is_actionable 为布尔值。"
+        "示例: {\"intent_type\":\"chat\",\"is_actionable\":false,\"risk_level\":\"low\",\"needs_confirmation\":false,\"reason\":\"...\"}\n"
+        f"domain={domain}\n"
+        f"message={text}\n"
+    )
+    try:
+        payload = {
+            "model": model,
+            "stream": False,
+            "format": "json",
+            "messages": [
+                {"role": "system", "content": "你是稳定的JSON分类器。"},
+                {"role": "user", "content": prompt},
+            ],
+            "options": {"temperature": 0},
+        }
+        resp = requests.post(f"{base_url}/api/chat", json=payload, timeout=(5, 20))
+        resp.raise_for_status()
+        content = (resp.json().get("message") or {}).get("content", "")
+    except Exception:
+        return None
+
+    parsed = _parse_json_object_loose(content)
+    if not parsed:
+        return None
+    intent = str(parsed.get("intent_type") or "").strip().lower()
+    if intent not in {"chat", "light_edit", "strong_action", "ambiguous"}:
+        return None
+    risk = str(parsed.get("risk_level") or "low").strip().lower()
+    if risk not in {"low", "medium", "high"}:
+        risk = "low"
+    return usecase_dto.IntentParseResult(
+        intent_type=intent,
+        is_actionable=bool(parsed.get("is_actionable")),
+        risk_level=risk,
+        needs_confirmation=bool(parsed.get("needs_confirmation")),
+        reason=str(parsed.get("reason") or ""),
+    )
+
+
+def classify_user_message_intent(message: str, context: dict[str, Any] | None = None) -> usecase_dto.IntentParseResult:
+    text = str(message or "").strip()
+    lower = text.lower()
+    domain = str((context or {}).get("domain") or "generic")
+    if not text:
+        return usecase_dto.IntentParseResult(intent_type="chat", reason="empty_message")
+
+    strong_tokens = [
+        "应用全部修正",
+        "应用全部建议",
+        "覆盖当前分配结果",
+        "重新归并",
+        "批量覆盖",
+        "批量应用",
+        "导出报销表",
+        "导出结果",
+    ]
+    if any(token in text for token in strong_tokens):
+        return usecase_dto.IntentParseResult(
+            intent_type="strong_action",
+            is_actionable=True,
+            risk_level="high",
+            needs_confirmation=True,
+            reason="matched_strong_tokens",
+        )
+
+    ambiguous_tokens = ["不太对", "怪怪的", "不对劲", "再看看", "你再看看", "感觉有问题", "这个有问题"]
+    if any(token in text for token in ambiguous_tokens):
+        return usecase_dto.IntentParseResult(
+            intent_type="ambiguous",
+            is_actionable=False,
+            risk_level="low",
+            needs_confirmation=False,
+            reason="matched_ambiguous_tokens",
+        )
+
+    chat_tokens = ["还缺什么", "为什么", "哪里金额不一致", "怎么分配", "说明", "解释", "全不全", "齐不齐", "有哪些问题"]
+    if "?" in text or "？" in text or any(token in text for token in chat_tokens):
+        return usecase_dto.IntentParseResult(
+            intent_type="chat",
+            is_actionable=False,
+            risk_level="low",
+            needs_confirmation=False,
+            reason="matched_chat_tokens",
+        )
+
+    if domain == "travel":
+        relabel_markers = ["这个是", "这张是", "应该是", "应归为", "算", "归到", "归类到", "改为", "改成", "类型改为", "类型是"]
+        doc_markers = [
+            "机票明细",
+            "酒店发票",
+            "交通票据",
+            "支付记录",
+            "酒店订单",
+            "订单截图",
+            "机票发票",
+            "高铁报销凭证",
+            "发票",
+            "票据",
+            "支付凭证",
+        ]
+        has_file_name_hint = bool(re.search(r"\.(pdf|jpg|jpeg|png|webp)\b", lower))
+        has_relabel_phrase = any(token in text for token in relabel_markers) or re.search(
+            r"(?:是|改为|改成|归为|归类为).{0,10}(?:发票|票据|明细|支付|订单|截图)",
+            text,
+        )
+        if _is_reclassify_command(text):
+            bulk_marker = any(token in text for token in ["全部", "所有", "这批", "批量", "都"])
+            return usecase_dto.IntentParseResult(
+                intent_type="strong_action" if bulk_marker else "light_edit",
+                is_actionable=True,
+                risk_level="medium" if bulk_marker else "low",
+                needs_confirmation=bulk_marker,
+                reason="travel_reidentify",
+            )
+        if has_relabel_phrase and any(token in text for token in doc_markers):
+            return usecase_dto.IntentParseResult(
+                intent_type="light_edit",
+                is_actionable=True,
+                risk_level="low",
+                needs_confirmation=False,
+                reason="travel_manual_relabel",
+            )
+        if has_file_name_hint and any(token in text for token in ["发票", "票据", "明细", "支付", "订单截图", "订单"]):
+            return usecase_dto.IntentParseResult(
+                intent_type="light_edit",
+                is_actionable=True,
+                risk_level="low",
+                needs_confirmation=False,
+                reason="travel_filetype_short_edit",
+            )
+        amount_set_match = re.search(
+            r"(?:金额|总价|价税合计|含税|小写|支付金额)[^\d¥￥\-]{0,12}"
+            r"(?:改为|改成|是|为|设为|写成|填成|调整为|=)\s*[¥￥]?\s*-?\d",
+            text,
+            flags=re.IGNORECASE,
+        )
+        if amount_set_match:
+            return usecase_dto.IntentParseResult(
+                intent_type="light_edit",
+                is_actionable=True,
+                risk_level="low",
+                needs_confirmation=False,
+                reason="travel_amount_edit",
+            )
+        if any(token in text for token in ["一趟", "同一趟", "同一次", "去程和返程"]):
+            return usecase_dto.IntentParseResult(
+                intent_type="strong_action",
+                is_actionable=True,
+                risk_level="medium",
+                needs_confirmation=True,
+                reason="travel_grouping_adjust",
+            )
+
+    if domain == "material":
+        if any(token in text for token in ["删除", "新增一行", "添加一行", "改为", "应为", "设置为", "设为"]) and any(
+            token in text for token in ["第", "行", "最后一行", "倒数第", "项目名称", "规格", "数量", "单位", "金额"]
+        ):
+            return usecase_dto.IntentParseResult(
+                intent_type="light_edit",
+                is_actionable=True,
+                risk_level="low",
+                needs_confirmation=False,
+                reason="material_row_edit",
+            )
+        if any(token in text for token in ["重新识别", "智能修复", "应用llm修复表", "应用llm结果", "应用对比结果"]):
+            return usecase_dto.IntentParseResult(
+                intent_type="strong_action",
+                is_actionable=True,
+                risk_level="high",
+                needs_confirmation=True,
+                reason="material_high_impact",
+            )
+
+    llm_guess = _infer_intent_with_llm(text, domain)
+    if llm_guess is not None:
+        return llm_guess
+
+    return usecase_dto.IntentParseResult(
+        intent_type="chat",
+        is_actionable=False,
+        risk_level="low",
+        needs_confirmation=False,
+        reason="default_chat_fallback",
+    )
 
 
 def _safe_float(value: Any) -> float | None:
@@ -143,6 +538,35 @@ def _extract_pdf_text_from_bytes(file_bytes: bytes) -> str:
     for page in reader.pages:
         pages.append((page.extract_text() or "").strip())
     return "\n".join(chunk for chunk in pages if chunk)
+
+
+PAGE_HOME_GUIDE = home_router.PAGE_HOME_GUIDE
+PAGE_TRAVEL_FLOW = home_router.PAGE_TRAVEL_FLOW
+PAGE_MATERIAL_FLOW = home_router.PAGE_MATERIAL_FLOW
+
+
+def _ensure_router_state() -> None:
+    home_router.ensure_router_state()
+
+
+def _set_current_page(page: str, *, pause_auto_route: bool = False, flash_message: str = "") -> None:
+    home_router.set_current_page(page, pause_auto_route=pause_auto_route, flash_message=flash_message)
+
+
+def _pop_router_flash_message() -> str:
+    return home_router.pop_router_flash_message()
+
+
+def _render_flow_back_to_home(flow: str) -> None:
+    home_router.render_flow_back_to_home(flow)
+
+
+def _get_guide_handoff_for_flow(flow: str) -> tuple[dict[str, Any], list[Any]]:
+    return home_router.get_guide_handoff_for_flow(flow)
+
+
+def _render_home_guide_agent() -> None:
+    home_router.render_home_guide_agent(UPLOAD_TYPES)
 
 
 def _env_flag_true(name: str) -> bool:
@@ -346,6 +770,57 @@ def _extract_json_from_text(text: str) -> dict[str, Any] | None:
     return parsed if isinstance(parsed, dict) else None
 
 
+def _sha1_of_bytes(data: bytes) -> str:
+    if not data:
+        return ""
+    return hashlib.sha1(data).hexdigest()
+
+
+@st.cache_data(show_spinner=False)
+def _extract_image_text_with_ollama(file_bytes: bytes) -> str:
+    if not _env_flag_true("USE_OLLAMA_VL"):
+        return ""
+
+    base_url = os.getenv("OLLAMA_BASE_URL", "http://127.0.0.1:11434").rstrip("/")
+    model = _vl_model()
+    encoded = base64.b64encode(file_bytes).decode("utf-8")
+    prompt = (
+        "请做OCR，只输出图片中的主要文本内容，尽量保持阅读顺序。"
+        "不要解释，不要总结，不要输出JSON。"
+    )
+
+    for mode in ("chat", "generate"):
+        try:
+            if mode == "chat":
+                payload = {
+                    "model": model,
+                    "stream": False,
+                    "messages": [{"role": "user", "content": prompt, "images": [encoded]}],
+                    "options": {"temperature": 0},
+                }
+                resp = requests.post(f"{base_url}/api/chat", json=payload, timeout=(8, 45))
+                resp.raise_for_status()
+                content = str((resp.json().get("message") or {}).get("content") or "").strip()
+            else:
+                payload = {
+                    "model": model,
+                    "stream": False,
+                    "prompt": prompt,
+                    "images": [encoded],
+                    "options": {"temperature": 0},
+                }
+                resp = requests.post(f"{base_url}/api/generate", json=payload, timeout=(8, 45))
+                resp.raise_for_status()
+                content = str(resp.json().get("response") or "").strip()
+            if content:
+                content = re.sub(r"^```[a-zA-Z]*\s*", "", content)
+                content = re.sub(r"\s*```$", "", content)
+                return content[:4000]
+        except Exception:
+            continue
+    return ""
+
+
 def _normalize_confidence(value: Any) -> float | None:
     confidence = _safe_float(value)
     if confidence is None:
@@ -496,12 +971,140 @@ def _resolve_travel_doc_type(
         return normalized_llm, "llm+rule_agree"
 
     rule_strength = _rule_confidence_for_doc_type(normalized_rule, raw_text)
+    merged = re.sub(r"\s+", "", (raw_text or "").lower())
+    invoice_core_count = _keyword_score(
+        merged,
+        ["电子发票", "发票号码", "开票日期", "购买方", "销售方", "价税合计"],
+    )
+    payment_core_count = _keyword_score(
+        merged,
+        ["账单详情", "交易成功", "支付时间", "付款方式", "商品说明", "交易单号", "交易号", "收单机构", "商户单号", "账单分类"],
+    )
+
+    # Guard 1: invoice-like documents should not be overridden to payment by a high-confidence LLM guess.
+    if normalized_rule in {"transport_ticket", "hotel_invoice"} and normalized_llm in {"transport_payment", "hotel_payment"}:
+        if invoice_core_count >= 2 and payment_core_count <= 1:
+            return normalized_rule, "rule_guard_invoice"
+
+    # Guard 2: structured detail pages should not be overridden to payment easily.
+    if normalized_rule in {"flight_detail", "hotel_order"} and normalized_llm in {"transport_payment", "hotel_payment"}:
+        if rule_strength >= 2:
+            return normalized_rule, "rule_guard_structured"
+
+    # For strongly structured screens (itinerary detail / hotel order detail),
+    # keep strict rule guard to avoid frequent "payment" over-classification.
+    if rule_strength >= 3 and normalized_rule in {"flight_detail", "hotel_order"}:
+        return normalized_rule, "rule_guard_strict"
     if rule_strength >= 3 and (llm_confidence is None or llm_confidence < 0.8):
         return normalized_rule, "rule_guard"
     if llm_confidence is not None and llm_confidence < 0.45 and rule_strength >= 2:
         return normalized_rule, "rule_guard"
 
     return normalized_llm, "llm_override"
+
+
+def _extract_doc_type_from_case_hit(hit: dict[str, Any]) -> str:
+    meta = dict(hit.get("metadata") or {})
+    doc_type = str(meta.get("doc_type") or "").strip()
+    if doc_type in TRAVEL_DOC_TYPES:
+        return doc_type
+
+    content = str(hit.get("content") or "")
+    match = re.search(r"doc_type\s*:\s*([a-z_]+)", content)
+    if not match:
+        return "unknown"
+    guessed = str(match.group(1) or "").strip()
+    return guessed if guessed in TRAVEL_DOC_TYPES else "unknown"
+
+
+def _lookup_learned_doc_type_override(
+    file_sha1: str,
+    file_name: str,
+    signal_text: str,
+    current_doc_type: str,
+) -> tuple[str | None, str]:
+    normalized_current = current_doc_type if current_doc_type in TRAVEL_DOC_TYPES else "unknown"
+    key = str(file_sha1 or "").strip()
+    name = str(file_name or "").strip()
+    signal = str(signal_text or "").strip()
+
+    if key:
+        try:
+            exact_hits = travel_usecase.retrieve_travel_case_hits(
+                query=f"file_sha1:{key}",
+                top_k=4,
+                metadata_filter={"case_kind": "file_doc_type", "file_sha1": key},
+            )
+        except Exception:
+            exact_hits = []
+        for hit in exact_hits:
+            doc_type = _extract_doc_type_from_case_hit(hit)
+            if doc_type in TRAVEL_DOC_TYPES and doc_type != "unknown":
+                return doc_type, "learned_file_hash"
+
+    if name:
+        try:
+            name_hits = travel_usecase.retrieve_travel_case_hits(
+                query=name,
+                top_k=6,
+            )
+        except Exception:
+            name_hits = []
+        name_lower = name.lower()
+        for hit in name_hits:
+            title = str(hit.get("title") or "").lower()
+            meta = dict(hit.get("metadata") or {})
+            meta_name = str(meta.get("file_name") or "").lower()
+            if name_lower and name_lower not in title and name_lower != meta_name:
+                continue
+            doc_type = _extract_doc_type_from_case_hit(hit)
+            if doc_type in TRAVEL_DOC_TYPES and doc_type != "unknown":
+                return doc_type, "learned_file_name"
+
+    if not signal:
+        return None, ""
+
+    try:
+        semantic_hits = travel_usecase.retrieve_travel_case_hits(
+            query=signal[:1500],
+            top_k=8,
+            metadata_filter={"case_kind": "file_doc_type"},
+        )
+    except Exception:
+        semantic_hits = []
+
+    vote_scores: dict[str, float] = {}
+    for hit in semantic_hits:
+        doc_type = _extract_doc_type_from_case_hit(hit)
+        if doc_type not in TRAVEL_DOC_TYPES or doc_type == "unknown":
+            continue
+        meta = dict(hit.get("metadata") or {})
+        score = float(hit.get("score") or 0.0)
+        if str(meta.get("source") or "").startswith("manual"):
+            score += 0.12
+        if str(meta.get("reason") or "").startswith("manual"):
+            score += 0.08
+        if str(meta.get("file_sha1") or "") == key and key:
+            score += 1.0
+        vote_scores[doc_type] = vote_scores.get(doc_type, 0.0) + max(0.0, score)
+
+    if not vote_scores:
+        return None, ""
+
+    ordered = sorted(vote_scores.items(), key=lambda item: item[1], reverse=True)
+    best_doc_type, best_score = ordered[0]
+    second_score = ordered[1][1] if len(ordered) > 1 else 0.0
+    margin = best_score - second_score
+
+    if normalized_current == "unknown" and best_score >= 0.75 and margin >= 0.15:
+        return best_doc_type, "learned_case"
+
+    pair = {"transport_payment", "flight_detail"}
+    if normalized_current in pair and best_doc_type in pair and best_doc_type != normalized_current:
+        if best_score >= 0.82 and margin >= 0.12:
+            return best_doc_type, "learned_case_pair_fix"
+
+    return None, ""
 
 
 def _normalize_payment_amount(value: Any) -> float | None:
@@ -553,6 +1156,53 @@ def _extract_payment_amount_from_model_output(content: str) -> float | None:
 
     amount = _extract_amount_from_text(content)
     return _normalize_payment_amount(amount)
+
+
+def _extract_invoice_total_with_tax_from_text(raw_text: str) -> float | None:
+    text = str(raw_text or "").strip()
+    if not text:
+        return None
+
+    normalized = text.replace("（", "(").replace("）", ")")
+    amount_pattern = r"([¥￥]?\s*-?(?:\d{1,3}(?:,\d{3})+|\d+)(?:\.\d{1,2})?)"
+
+    # Highest priority: 价税合计(小写)金额。
+    for pattern in [
+        rf"价税合计\s*\(\s*小写\s*\)\s*[:：]?\s*{amount_pattern}",
+        rf"\(\s*小写\s*\)\s*[:：]?\s*{amount_pattern}",
+        rf"小写\s*[:：]?\s*{amount_pattern}",
+    ]:
+        match = re.search(pattern, normalized, flags=re.IGNORECASE | re.MULTILINE)
+        if not match:
+            continue
+        amount = _normalize_payment_amount(match.group(1))
+        if amount is not None:
+            return amount
+
+    # Next: explicit 价税合计数值。
+    match = re.search(
+        rf"价税合计\s*[:：]?\s*{amount_pattern}",
+        normalized,
+        flags=re.IGNORECASE | re.MULTILINE,
+    )
+    if match:
+        amount = _normalize_payment_amount(match.group(1))
+        if amount is not None:
+            return amount
+
+    # Common invoice line: 合计 不含税 税额 => 含税总价 = 两者之和。
+    total_line_match = re.search(
+        rf"(?:^|[\s\r\n])合计[^\n\r]{{0,80}}?{amount_pattern}\s+{amount_pattern}",
+        normalized,
+        flags=re.IGNORECASE | re.MULTILINE,
+    )
+    if total_line_match:
+        no_tax_total = _normalize_payment_amount(total_line_match.group(1))
+        tax_total = _normalize_payment_amount(total_line_match.group(2))
+        if no_tax_total is not None and tax_total is not None:
+            return float(no_tax_total + tax_total)
+
+    return None
 
 
 @st.cache_data(show_spinner=False)
@@ -665,31 +1315,9 @@ def _auto_extract_amount_from_ticket(uploaded_file) -> float | None:
     if suffix == ".pdf":
         try:
             raw_text = _extract_pdf_text_from_bytes(file_bytes)
-            # Prefer invoice total-with-tax (价税合计小写) for reimbursement amount.
-            amount_small_text = None
-            for pattern in [
-                r"(?:价税合计\s*[（(]小写[)）]|[（(]小写[)）])[:：]?\s*[¥￥]?\s*([\d,]+(?:\.\d{1,2})?)",
-                r"(?:价税合计|金额合计|合计金额)[:：]?\s*[¥￥]?\s*([\d,]+(?:\.\d{1,2})?)",
-            ]:
-                match = re.search(pattern, raw_text, flags=re.IGNORECASE | re.MULTILINE)
-                if match:
-                    amount_small_text = (match.group(1) or "").strip()
-                    if amount_small_text:
-                        break
-            amount_small = _safe_float(amount_small_text)
-            if amount_small is not None:
-                return amount_small
-
-            total_line_match = re.search(
-                r"(?:^|[\s\r\n])合计[^\n\r]{0,60}?([¥￥]?\s*[\d,]+\.\d{2})\s+([¥￥]?\s*[\d,]+\.\d{2})",
-                raw_text,
-                flags=re.IGNORECASE | re.MULTILINE,
-            )
-            if total_line_match:
-                no_tax_total = _safe_float(total_line_match.group(1))
-                tax_total = _safe_float(total_line_match.group(2))
-                if no_tax_total is not None and tax_total is not None:
-                    return float(no_tax_total + tax_total)
+            total_with_tax = _extract_invoice_total_with_tax_from_text(raw_text)
+            if total_with_tax is not None:
+                return total_with_tax
 
             extracted = material_usecase.extract_invoice_fields(raw_text)
             amount = _safe_float(extracted.get("amount"))
@@ -716,7 +1344,12 @@ def _auto_extract_amount_from_ticket(uploaded_file) -> float | None:
         except Exception:
             return None
 
-    # 对图片票据优先用视觉模型识别。
+    # 对图片票据先做 OCR+规则抽取“价税合计(小写)”，再回退到模型金额识别。
+    image_text = _extract_image_text_with_ollama(file_bytes)
+    total_with_tax = _extract_invoice_total_with_tax_from_text(image_text)
+    if total_with_tax is not None:
+        return total_with_tax
+
     amount = _extract_payment_amount_with_ollama(file_bytes)
     if amount is not None:
         return amount
@@ -778,6 +1411,56 @@ def _profile_file_key(profile: dict[str, Any]) -> str:
     file_obj = profile.get("file")
     size = getattr(file_obj, "size", "") if file_obj is not None else ""
     return _travel_file_key(str(profile.get("name") or ""), size)
+
+
+def _uploaded_file_size_label(size_value: Any) -> str:
+    try:
+        size = int(size_value or 0)
+    except Exception:
+        size = 0
+    if size <= 0:
+        return "-"
+    if size < 1024:
+        return f"{size} B"
+    if size < 1024 * 1024:
+        return f"{size / 1024:.1f} KB"
+    return f"{size / (1024 * 1024):.2f} MB"
+
+
+def _render_included_file_list(
+    *,
+    flow_label: str,
+    page_uploaded_files: list[Any],
+    guide_files: list[Any],
+    merged_files: list[Any],
+) -> None:
+    guide_list = _as_uploaded_list(guide_files)
+    if not guide_list:
+        return
+    page_list = _as_uploaded_list(page_uploaded_files)
+    merged_list = _as_uploaded_list(merged_files)
+    guide_keys = {_uploaded_file_key(item) for item in guide_list}
+    page_keys = {_uploaded_file_key(item) for item in page_list}
+    rows: list[dict[str, Any]] = []
+    for idx, item in enumerate(merged_list, start=1):
+        key = _uploaded_file_key(item)
+        source_tags: list[str] = []
+        if key in guide_keys:
+            source_tags.append("首页带入")
+        if key in page_keys:
+            source_tags.append("当前页上传")
+        rows.append(
+            {
+                "序号": idx,
+                "文件名": str(getattr(item, "name", "") or ""),
+                "大小": _uploaded_file_size_label(getattr(item, "size", 0)),
+                "来源": " + ".join(source_tags) if source_tags else "流程缓存",
+            }
+        )
+
+    with st.expander(f"查看{flow_label}已纳入文件清单（共 {len(rows)} 份）", expanded=True):
+        st.caption("说明：上传控件仅显示当前页手动选择文件；首页带入文件也会出现在下表并参与处理。")
+        st.dataframe(rows, hide_index=True, use_container_width=True)
 
 
 def _set_manual_override_for_profile(manual_overrides: dict[str, str], profile: dict[str, Any]) -> None:
@@ -1277,19 +1960,24 @@ def _infer_doc_type_from_visual_keywords(text: str) -> str:
     if any(k in merged for k in flight_detail_keys):
         return "flight_detail"
 
-    payment_hit = any(k in merged for k in payment_core_keys)
+    payment_core_count = _keyword_score(merged, payment_core_keys)
+    payment_hit = payment_core_count > 0
     transport_hit = any(k in merged for k in transport_keys)
     hotel_hit = any(k in merged for k in hotel_keys)
+    invoice_core_keys = ["电子发票", "发票号码", "开票日期", "购买方", "销售方", "价税合计"]
+    invoice_core_count = _keyword_score(merged, invoice_core_keys)
     invoice_hit = any(k in merged for k in invoice_keys) or ("发票" in merged)
 
-    if payment_hit:
-        if hotel_hit and not transport_hit:
-            return "hotel_payment"
-        if transport_hit and not hotel_hit:
-            return "transport_payment"
-        if "在线付" in merged and hotel_hit:
-            return "hotel_payment"
-        return "transport_payment"
+    # Strong invoice header markers should win over payment-like words.
+    if invoice_core_count >= 2:
+        if "代订机票费" in merged or (transport_hit and not hotel_hit):
+            return "transport_ticket"
+        if "住宿服务" in merged or (hotel_hit and not transport_hit):
+            return "hotel_invoice"
+        if transport_hit:
+            return "transport_ticket"
+        if hotel_hit:
+            return "hotel_invoice"
 
     if invoice_hit:
         if transport_hit and not hotel_hit:
@@ -1300,6 +1988,21 @@ def _infer_doc_type_from_visual_keywords(text: str) -> str:
             return "transport_ticket"
         if "住宿服务" in merged:
             return "hotel_invoice"
+
+    # Payment classification requires stronger payment evidence, otherwise it is too noisy.
+    if payment_core_count >= 2 and invoice_core_count == 0:
+        if hotel_hit and not transport_hit:
+            return "hotel_payment"
+        if transport_hit and not hotel_hit:
+            return "transport_payment"
+        if "在线付" in merged and hotel_hit:
+            return "hotel_payment"
+        return "transport_payment"
+
+    if payment_hit and invoice_core_count == 0:
+        if hotel_hit and not transport_hit:
+            return "hotel_payment"
+        return "transport_payment"
 
     if hotel_hit and not transport_hit:
         return "hotel_invoice"
@@ -1358,7 +2061,21 @@ def _travel_signal_features(file_name: str, raw_text: str) -> dict[str, bool]:
     )
     detail_hit = any(
         key in combined
-        for key in ["机票明细", "行程单", "电子客票行程单", "客票行程", "航段", "itinerary", "tripdetail"]
+        for key in [
+            "机票明细",
+            "价格明细",
+            "票价明细",
+            "普通成人",
+            "机建",
+            "燃油",
+            "票价",
+            "行程单",
+            "电子客票行程单",
+            "客票行程",
+            "航段",
+            "itinerary",
+            "tripdetail",
+        ]
     )
 
     platform_hit = any(key in combined for key in ["携程", "飞猪", "美团", "同程", "booking", "trip.com"])
@@ -1475,6 +2192,12 @@ def _classify_travel_doc_with_ollama(
         "4) 酒店订单明细常见关键词：携程旅行/飞猪旅行、订单号、几晚明细、费用明细、取消政策、在线付。\n"
         "5) 酒店发票常见关键词：电子发票、住宿/房费、入住/离店、价税合计。\n"
         "6) 若同一图有“在线付+几晚明细+费用明细”，优先判为 hotel_order，不要判成 hotel_payment。\n"
+        "7) 若出现“价格明细/普通成人/机票/燃油/机建”这类票价拆分信息，应优先判为 flight_detail；"
+        "即使页面也出现订单号或行程信息，也不要判成 transport_payment。\n"
+        "8) 若识别到“电子发票/发票号码/购买方/销售方/价税合计”中任意2项及以上，"
+        "必须判为 transport_ticket 或 hotel_invoice，禁止判为 payment 类型。\n"
+        "9) 只有出现至少两项支付凭证核心词（账单详情、交易成功、支付时间、付款方式、交易号）时，"
+        "才允许判为 transport_payment/hotel_payment。\n"
         "输出必须是单个 JSON 对象，不要任何额外文本，格式如下：\n"
         '{"doc_type":"transport_payment","confidence":0.88,"amount":"2360.00","date":"2026-03-13","evidence":"命中关键词: 账单详情,交易成功,商品说明","ocr_text":"...","keywords":["账单详情","交易成功","商品说明"]}\n'
         "约束：\n"
@@ -1599,6 +2322,7 @@ def _recognize_travel_file(uploaded_file: Any, index: int, retry_tag: str = "") 
     file_name = str(getattr(uploaded_file, "name", ""))
     suffix = Path(file_name).suffix.lower()
     file_bytes = uploaded_file.getvalue()
+    file_sha1 = _sha1_of_bytes(file_bytes)
 
     raw_text = ""
     if suffix == ".pdf":
@@ -1622,6 +2346,8 @@ def _recognize_travel_file(uploaded_file: Any, index: int, retry_tag: str = "") 
         retry_tag=retry_tag,
     )
     llm_ocr_text = str((llm_result or {}).get("ocr_text") or "").strip()
+    if not llm_ocr_text and suffix in {".png", ".jpg", ".jpeg", ".webp"}:
+        llm_ocr_text = _extract_image_text_with_ollama(file_bytes)
     if llm_ocr_text:
         ocr_rule_guess = _guess_travel_doc_type("", llm_ocr_text)
         if rule_guess == "unknown" and ocr_rule_guess != "unknown":
@@ -1635,12 +2361,27 @@ def _recognize_travel_file(uploaded_file: Any, index: int, retry_tag: str = "") 
     llm_confidence = _normalize_confidence((llm_result or {}).get("confidence"))
     merged_signal_text = "\n".join(part for part in [raw_text, llm_ocr_text] if part)
     guessed, source = _resolve_travel_doc_type(rule_guess, llm_guess, llm_confidence, merged_signal_text)
+    learned_doc_type, learned_source = _lookup_learned_doc_type_override(
+        file_sha1,
+        file_name,
+        merged_signal_text,
+        guessed,
+    )
+    if learned_doc_type and learned_doc_type in TRAVEL_DOC_TYPES and learned_doc_type != guessed:
+        guessed = learned_doc_type
+        source = learned_source or source
 
     amount: float | None = None
     llm_amount = _normalize_payment_amount((llm_result or {}).get("amount"))
     if guessed in {"transport_ticket", "hotel_invoice"}:
+        invoice_total_from_text = _extract_invoice_total_with_tax_from_text(raw_text) or _extract_invoice_total_with_tax_from_text(
+            llm_ocr_text
+        )
+        if invoice_total_from_text is not None:
+            amount = invoice_total_from_text
         # For invoices, reimbursement should use tax-included total from invoice text first.
-        amount = _auto_extract_amount_from_ticket(uploaded_file)
+        if amount is None:
+            amount = _auto_extract_amount_from_ticket(uploaded_file)
         if amount is None and llm_amount is not None:
             amount = llm_amount
     elif guessed in {"transport_payment", "hotel_payment"}:
@@ -1674,6 +2415,10 @@ def _recognize_travel_file(uploaded_file: Any, index: int, retry_tag: str = "") 
         "source": source,
         "confidence": llm_confidence,
         "evidence": evidence,
+        "file_sha1": file_sha1,
+        "raw_text": raw_text[:3000] if raw_text else "",
+        "ocr_text": llm_ocr_text[:3000] if llm_ocr_text else "",
+        "signal_text": merged_signal_text[:3500] if merged_signal_text else "",
     }
 
 
@@ -1746,6 +2491,165 @@ def _build_travel_agent_status(assignment: dict[str, Any]) -> dict[str, Any]:
     return travel_usecase.build_travel_agent_status(assignment)
 
 
+def _travel_scope_name() -> str:
+    return "travel_agent"
+
+
+def _travel_undo_stack_key() -> str:
+    return "travel_agent_undo_stack"
+
+
+def _clone_travel_profile(profile: dict[str, Any]) -> dict[str, Any]:
+    if not isinstance(profile, dict):
+        return {}
+    return {
+        "profile_id": profile.get("profile_id"),
+        "index": profile.get("index"),
+        "file": profile.get("file"),
+        "name": profile.get("name"),
+        "suffix": profile.get("suffix"),
+        "doc_type": profile.get("doc_type"),
+        "amount": profile.get("amount"),
+        "date_obj": profile.get("date_obj"),
+        "date": profile.get("date"),
+        "slot": profile.get("slot"),
+        "source": profile.get("source"),
+        "confidence": profile.get("confidence"),
+        "evidence": profile.get("evidence"),
+        "file_sha1": profile.get("file_sha1"),
+        "raw_text": profile.get("raw_text"),
+        "ocr_text": profile.get("ocr_text"),
+        "signal_text": profile.get("signal_text"),
+    }
+
+
+def _clone_travel_assignment(assignment: dict[str, Any]) -> dict[str, Any]:
+    output: dict[str, Any] = {}
+    for key, value in dict(assignment or {}).items():
+        if isinstance(value, list):
+            output[key] = list(value)
+        else:
+            output[key] = value
+    return output
+
+
+def _travel_push_undo_snapshot(
+    assignment: dict[str, Any],
+    profiles: list[dict[str, Any]],
+    manual_overrides: dict[str, str] | None = None,
+) -> None:
+    stack = st.session_state.setdefault(_travel_undo_stack_key(), [])
+    if not isinstance(stack, list):
+        stack = []
+    stack.append(
+        {
+            "assignment": _clone_travel_assignment(assignment),
+            "profiles": [_clone_travel_profile(p) for p in profiles],
+            "manual_overrides": dict(manual_overrides or {}),
+            "time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        }
+    )
+    if len(stack) > 20:
+        stack = stack[-20:]
+    st.session_state[_travel_undo_stack_key()] = stack
+
+
+def _travel_pop_undo_snapshot() -> dict[str, Any] | None:
+    stack = st.session_state.get(_travel_undo_stack_key())
+    if not isinstance(stack, list) or not stack:
+        return None
+    snapshot = stack.pop()
+    st.session_state[_travel_undo_stack_key()] = stack
+    return dict(snapshot) if isinstance(snapshot, dict) else None
+
+
+def _travel_restore_undo_snapshot(snapshot: dict[str, Any]) -> tuple[dict[str, Any], list[dict[str, Any]], dict[str, str]]:
+    assignment = _clone_travel_assignment(dict(snapshot.get("assignment") or {}))
+    profiles = [_clone_travel_profile(p) for p in list(snapshot.get("profiles") or []) if isinstance(p, dict)]
+    manual_overrides = dict(snapshot.get("manual_overrides") or {})
+    return assignment, profiles, manual_overrides
+
+
+def _travel_build_pending_action_from_text(user_text: str) -> dict[str, Any] | None:
+    text = str(user_text or "").strip()
+    if not text:
+        return None
+    if any(token in text for token in ["应用全部修正", "应用全部建议", "覆盖当前分配结果"]):
+        return _append_pending_action(
+            _travel_scope_name(),
+            action_type="travel_apply_all",
+            summary="批量应用当前差旅整理建议",
+            target="当前全部待确认建议",
+            risk_level="high",
+            payload={"command": text},
+        )
+    if any(token in text for token in ["重新归并", "重新分配", "重排分组", "同一趟"]):
+        return _append_pending_action(
+            _travel_scope_name(),
+            action_type="travel_reorganize",
+            summary="重新归并差旅材料并刷新槽位分配",
+            target="全部已上传材料",
+            risk_level="medium",
+            payload={"command": text},
+        )
+    if any(token in text for token in ["导出报销表", "导出结果", "导出压缩包"]):
+        return _append_pending_action(
+            _travel_scope_name(),
+            action_type="travel_export",
+            summary="确认导出当前差旅材料压缩包",
+            target="差旅导出",
+            risk_level="high",
+            payload={"command": text},
+        )
+    return _append_pending_action(
+        _travel_scope_name(),
+        action_type="travel_manual_confirm",
+        summary="执行一条需要确认的差旅调整",
+        target=text[:80],
+        risk_level="medium",
+        payload={"command": text},
+    )
+
+
+def _travel_execute_pending_action(
+    action: dict[str, Any],
+    pool_list: list[Any],
+    assignment: dict[str, Any],
+    profiles: list[dict[str, Any]],
+    manual_overrides: dict[str, str],
+) -> tuple[bool, str, dict[str, Any], list[dict[str, Any]]]:
+    action_type = str(action.get("action_type") or "")
+    if action_type == "travel_reorganize":
+        new_assignment, new_profiles = _organize_travel_materials(pool_list, manual_overrides=manual_overrides)
+        return True, "已完成重新归并，并刷新去程/返程/酒店分配。", new_assignment, new_profiles
+    if action_type == "travel_export":
+        st.session_state["travel_export_confirmed_from_chat"] = True
+        return True, "已确认导出。请在下方“差旅材料打包导出”点击导出按钮。", assignment, profiles
+    if action_type == "travel_apply_all":
+        # 当前版本批量建议主要是确认执行入口，实际变更由具体动作触发。
+        return True, "已确认批量应用请求。若有待确认分类动作，会逐条执行。", assignment, profiles
+    if action_type == "travel_manual_confirm":
+        command = str((action.get("payload") or {}).get("command") or action.get("target") or "").strip()
+        if not command:
+            return False, "待确认动作缺少可执行内容。", assignment, profiles
+
+        recheck_count, _, recheck_error = _apply_reclassify_from_user_text(command, profiles, manual_overrides=manual_overrides)
+        if recheck_error:
+            return False, recheck_error, assignment, profiles
+        if recheck_count > 0:
+            new_assignment = _build_assignment_from_profiles(profiles)
+            return True, f"已按确认内容重新识别 {recheck_count} 份材料。", new_assignment, profiles
+
+        changed_count, _, _ = _apply_manual_relabel_from_user_text(command, profiles)
+        if changed_count > 0:
+            _remember_manual_overrides(manual_overrides, profiles)
+            new_assignment = _build_assignment_from_profiles(profiles)
+            return True, f"已按确认内容调整 {changed_count} 份材料分类。", new_assignment, profiles
+        return False, "确认后未命中可执行变更，请补充更具体的目标。", assignment, profiles
+
+    return False, f"暂不支持的动作类型：{action_type}", assignment, profiles
+
+
 def _merge_uploaded_lists(first: list[Any], second: list[Any]) -> list[Any]:
     return travel_usecase.merge_uploaded_lists(first, second)
 
@@ -1757,11 +2661,14 @@ def _target_doc_type_from_user_text(user_text: str, file_name: str) -> str | Non
 
     if any(key in merged for key in ["订单截图", "酒店订单", "订单图", "hotel order"]):
         return "hotel_order"
-    if any(key in merged for key in ["机票明细", "行程单", "客票行程", "itinerary", "detail"]):
+    if any(
+        key in merged
+        for key in ["机票明细", "去程明细", "返程明细", "票价明细", "价格明细", "行程单", "客票行程", "itinerary", "detail"]
+    ):
         return "flight_detail"
     if any(key in merged for key in ["酒店支付", "酒店支付记录", "酒店支付凭证"]):
         return "hotel_payment"
-    if any(key in merged for key in ["交通支付", "机票支付", "高铁支付", "支付记录", "支付凭证"]):
+    if any(key in merged for key in ["交通支付", "机票支付", "高铁支付", "去程支付记录", "返程支付记录", "支付记录", "支付凭证"]):
         if any(key in merged for key in ["酒店", "住宿"]):
             return "hotel_payment"
         return "transport_payment"
@@ -1769,11 +2676,96 @@ def _target_doc_type_from_user_text(user_text: str, file_name: str) -> str | Non
         return "hotel_invoice"
     if any(key in merged for key in ["机票发票", "高铁报销凭证", "交通发票", "交通票据"]):
         return "transport_ticket"
+    if any(key in merged for key in ["票据"]):
+        if any(key in merged for key in ["酒店", "住宿"]):
+            return "hotel_invoice"
+        return "transport_ticket"
     if "发票" in merged:
         if any(key in merged for key in ["酒店", "住宿"]):
             return "hotel_invoice"
         return "transport_ticket"
     return None
+
+
+def _match_profiles_by_user_text(user_text: str, profiles: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    text = str(user_text or "").strip()
+    if not text:
+        return []
+
+    sorted_profiles = sorted(profiles, key=lambda p: len(str(p.get("name") or "")), reverse=True)
+    matched: list[dict[str, Any]] = []
+    seen_ids: set[str] = set()
+    for profile in sorted_profiles:
+        name = str(profile.get("name") or "")
+        if not name or name not in text:
+            continue
+        pid = str(profile.get("profile_id") or "")
+        if pid and pid in seen_ids:
+            continue
+        if pid:
+            seen_ids.add(pid)
+        matched.append(profile)
+    return matched
+
+
+def _extract_amount_set_value_from_text(user_text: str) -> float | None:
+    text = str(user_text or "").strip()
+    if not text:
+        return None
+
+    pattern = (
+        r"(?:金额|总价|价税合计|含税|小写|支付金额)[^\d¥￥\-]{0,12}"
+        r"(?:改为|改成|是|为|设为|写成|填成|调整为|=)\s*"
+        r"([¥￥]?\s*-?(?:\d{1,3}(?:,\d{3})+|\d+)(?:\.\d{1,2})?)"
+    )
+    match = re.search(pattern, text, flags=re.IGNORECASE)
+    if match:
+        return _normalize_payment_amount(match.group(1))
+
+    if any(token in text for token in ["金额", "总价", "价税合计", "含税"]):
+        tail_match = re.search(
+            r"(?:改为|改成|设为|写成|填成|调整为|=)\s*"
+            r"([¥￥]?\s*-?(?:\d{1,3}(?:,\d{3})+|\d+)(?:\.\d{1,2})?)\s*(?:元)?\s*$",
+            text,
+            flags=re.IGNORECASE,
+        )
+        if tail_match:
+            return _normalize_payment_amount(tail_match.group(1))
+
+    return None
+
+
+def _apply_manual_amount_from_user_text(
+    user_text: str,
+    profiles: list[dict[str, Any]],
+) -> tuple[int, list[str], float | None, str | None]:
+    text = str(user_text or "").strip()
+    if not text:
+        return 0, [], None, None
+
+    target_amount = _extract_amount_set_value_from_text(text)
+    if target_amount is None:
+        return 0, [], None, None
+
+    matched_profiles = _match_profiles_by_user_text(text, profiles)
+    if not matched_profiles and len(profiles) == 1:
+        matched_profiles = list(profiles)
+
+    if not matched_profiles:
+        return 0, [], target_amount, "没有匹配到要改金额的文件名。请写成：`某文件.pdf 金额是 746`。"
+
+    changed_names: list[str] = []
+    for profile in matched_profiles:
+        current_amount = _normalize_payment_amount(profile.get("amount"))
+        if current_amount is not None and abs(current_amount - target_amount) <= 0.01:
+            continue
+        profile["amount"] = float(target_amount)
+        profile["source"] = "manual_chat_amount"
+        profile["confidence"] = 1.0
+        profile["evidence"] = f"人工对话改金额 -> {_format_amount(target_amount)}"
+        changed_names.append(str(profile.get("name") or ""))
+
+    return len(changed_names), changed_names, target_amount, None
 
 
 def _parse_relabel_count_hint(user_text: str, max_count: int) -> int:
@@ -1939,6 +2931,10 @@ def _apply_reclassify_from_user_text(
             "source",
             "confidence",
             "evidence",
+            "file_sha1",
+            "raw_text",
+            "ocr_text",
+            "signal_text",
         ]:
             profile[key] = refreshed.get(key)
 
@@ -2016,14 +3012,50 @@ def _generate_travel_agent_reply_rule(
     if any(key in text for key in ["导出", "打包", "压缩包"]):
         return "可以直接在下方“差旅材料打包导出”输入压缩包名称，然后点击“导出差旅材料压缩包”。"
 
-    summary = "材料整理完成。"
+    summary = f"我这边已整理 {len(profiles or [])} 份材料。"
     if status["missing"]:
-        summary += f" 目前缺 {len(status['missing'])} 项。"
+        summary += f" 还缺 {len(status['missing'])} 项。"
     if status["issues"]:
         summary += f" 发现 {len(status['issues'])} 个金额核对问题。"
     if not status["missing"] and not status["issues"]:
-        summary += " 当前可进入导出。"
+        summary += " 当前材料已基本齐全。"
+    summary += " 你可以继续点名文件告诉我“它是什么类型”，我会直接改。"
     return summary
+
+
+def _short_join_items(items: list[str], limit: int = 3, empty_text: str = "无") -> str:
+    cleaned = [str(item).strip() for item in list(items or []) if str(item).strip()]
+    if not cleaned:
+        return empty_text
+    head = cleaned[:limit]
+    text = "；".join(head)
+    if len(cleaned) > limit:
+        text += f"（另有{len(cleaned) - limit}项）"
+    return text
+
+
+def _build_travel_handoff_status_reply(
+    *,
+    profiles: list[dict[str, Any]],
+    status: dict[str, Any],
+    guide_files: list[Any],
+) -> str:
+    type_counts: dict[str, int] = {}
+    for profile in profiles:
+        label = _doc_type_label(str(profile.get("doc_type") or "unknown"))
+        type_counts[label] = type_counts.get(label, 0) + 1
+    type_text = (
+        "、".join(f"{name}{count}份" for name, count in sorted(type_counts.items(), key=lambda x: (-x[1], x[0]))[:5])
+        if type_counts
+        else "暂未识别到明确类型"
+    )
+    missing_text = _short_join_items(list(status.get("missing") or []), limit=3, empty_text="暂无明显缺件")
+    issue_text = _short_join_items(list(status.get("issues") or []), limit=2, empty_text="暂无金额核对异常")
+    return _compose_three_stage_reply(
+        f"已接收首页带入的 {len(_as_uploaded_list(guide_files))} 份材料，并完成当前批次差旅识别。",
+        f"当前识别概览：{type_text}。缺件：{missing_text}。金额核对：{issue_text}。",
+        "你可以继续说“现在还缺什么”或“哪个和哪个对不上”，我会按去程/返程/酒店逐项解释。",
+    )
 
 
 def _build_travel_agent_context_text(assignment: dict[str, Any], status: dict[str, Any], profiles: list[dict[str, Any]]) -> str:
@@ -2177,7 +3209,21 @@ def _render_travel_conversation_agent() -> dict[str, Any]:
         accept_multiple_files=True,
         key="travel_agent_pool_files",
     )
-    pool_list = _as_uploaded_list(pool_files)
+    page_uploaded_files = _as_uploaded_list(pool_files)
+    pool_list = list(page_uploaded_files)
+    guide_payload, guide_files = _get_guide_handoff_for_flow("travel")
+    if guide_files:
+        pool_list = _merge_uploaded_lists(pool_list, _as_uploaded_list(guide_files))
+        st.info(f"已从首页引导带入 {len(guide_files)} 份材料，可直接开始整理。")
+        _render_included_file_list(
+            flow_label="差旅流程",
+            page_uploaded_files=page_uploaded_files,
+            guide_files=guide_files,
+            merged_files=pool_list,
+        )
+    if guide_payload:
+        with st.expander("首页引导摘要（已带入）", expanded=False):
+            st.json(guide_payload)
     manual_overrides = st.session_state.setdefault("travel_agent_manual_overrides", {})
     if not isinstance(manual_overrides, dict):
         manual_overrides = {}
@@ -2198,6 +3244,9 @@ def _render_travel_conversation_agent() -> dict[str, Any]:
         st.session_state.pop("travel_agent_assignment", None)
         st.session_state.pop("travel_agent_profiles", None)
         st.session_state.pop("travel_agent_manual_overrides", None)
+        st.session_state.pop(_travel_undo_stack_key(), None)
+        _clear_pending_actions(_travel_scope_name())
+        _clear_last_applied_action(_travel_scope_name())
         st.success("识别缓存已清空，请重新点击“Agent整理材料”。")
         st.rerun()
 
@@ -2217,11 +3266,74 @@ def _render_travel_conversation_agent() -> dict[str, Any]:
         st.session_state["travel_agent_assignment"] = assignment
         st.session_state["travel_agent_profiles"] = profiles
 
+    messages = st.session_state.setdefault("travel_agent_messages", [])
+    if not messages:
+        messages.append(
+            {
+                "role": "assistant",
+                "content": _compose_three_stage_reply(
+                    "我看到了，你可以把这次差旅材料都交给我。",
+                    "我会先按内容做分类和归组，再持续显示缺件、异常与待确认动作。",
+                    "你可以先问“现在还缺什么”，也可以说“这张应是机票明细”。",
+                ),
+            }
+        )
+
     if not pool_list:
         st.info("请先上传差旅材料，我会自动分类到去程/返程/酒店，并告诉你缺什么。")
         return {"missing": [], "issues": [], "tips": [], "complete": False}
 
     status = _build_travel_agent_status(assignment)
+    pending_actions = [item for item in _get_pending_actions(_travel_scope_name()) if str(item.get("status") or "pending") == "pending"]
+    if guide_files or guide_payload:
+        handoff_token = (
+            f"travel|{str(st.session_state.get('guide_handoff_entered_at') or '')}"
+            f"|{_files_signature(_as_uploaded_list(guide_files))}|{current_signature}"
+        )
+        last_token = str(st.session_state.get("travel_agent_handoff_summary_token") or "")
+        if handoff_token and handoff_token != last_token:
+            messages.append(
+                {
+                    "role": "assistant",
+                    "content": _build_travel_handoff_status_reply(
+                        profiles=profiles,
+                        status=status,
+                        guide_files=guide_files,
+                    ),
+                }
+            )
+            st.session_state["travel_agent_handoff_summary_token"] = handoff_token
+
+    st.markdown("### 当前任务状态")
+    s1, s2, s3, s4, s5, s6 = st.columns(6)
+    s1.metric("任务类型", "差旅")
+    s2.metric("已识别材料", len(profiles))
+    s3.metric("缺件数", len(status.get("missing") or []))
+    s4.metric("异常数", len(status.get("issues") or []))
+    s5.metric("待确认动作", len(pending_actions))
+    s6.metric("状态", "可提交" if status.get("complete") else "待补充")
+
+    with st.expander("查看分类与归组摘要", expanded=False):
+        type_counts: dict[str, int] = {}
+        slot_counts: dict[str, int] = {}
+        for profile in profiles:
+            type_key = _doc_type_label(str(profile.get("doc_type") or "unknown"))
+            slot_key = _slot_label(str(profile.get("slot") or "unknown"))
+            type_counts[type_key] = type_counts.get(type_key, 0) + 1
+            slot_counts[slot_key] = slot_counts.get(slot_key, 0) + 1
+        st.markdown("**当前分类结果**")
+        st.dataframe(
+            [{"类别": key, "数量": value} for key, value in sorted(type_counts.items(), key=lambda x: (-x[1], x[0]))],
+            hide_index=True,
+            use_container_width=True,
+        )
+        st.markdown("**当前归组结果**")
+        st.dataframe(
+            [{"槽位": key, "数量": value} for key, value in sorted(slot_counts.items(), key=lambda x: (-x[1], x[0]))],
+            hide_index=True,
+            use_container_width=True,
+        )
+
     if status["missing"]:
         st.warning("仍缺材料：" + "、".join(status["missing"]))
     else:
@@ -2257,10 +3369,7 @@ def _render_travel_conversation_agent() -> dict[str, Any]:
         )
     if profile_rows:
         st.dataframe(profile_rows, use_container_width=True, hide_index=True)
-    st.caption(
-        "可直接在对话里纠正分类，例如：`朱洪良.pdf 应该是机票发票`、`某某.jpg 应该是酒店订单截图`、"
-        "`未知这三个是机票明细`、`重新识别 2360元_支付凭证长春到上海机票4人.jpg`。"
-    )
+    st.caption("你可以自然表达：比如“这张应该算机票明细”“为什么分到返程支付记录”“还缺什么”。")
 
     if profiles:
         doc_type_to_label = {
@@ -2300,6 +3409,9 @@ def _render_travel_conversation_agent() -> dict[str, Any]:
                 key="travel_agent_manual_editor",
             )
             if st.button("应用修正并重新分配", key="travel_agent_apply_manual", use_container_width=True):
+                snapshot_assignment = _clone_travel_assignment(assignment)
+                snapshot_profiles = [_clone_travel_profile(p) for p in profiles]
+                snapshot_manual_overrides = dict(manual_overrides)
                 id_to_profile = {str(p.get("profile_id")): p for p in profiles}
                 changed = 0
                 for row in edited_rows:
@@ -2317,23 +3429,155 @@ def _render_travel_conversation_agent() -> dict[str, Any]:
                     changed += 1
 
                 if changed > 0:
+                    _travel_push_undo_snapshot(snapshot_assignment, snapshot_profiles, snapshot_manual_overrides)
                     assignment = _build_assignment_from_profiles(profiles)
                     st.session_state["travel_agent_assignment"] = assignment
                     st.session_state["travel_agent_profiles"] = profiles
                     travel_usecase.learn_from_profiles(profiles, assignment, reason="manual_table")
-                    st.success(f"已应用 {changed} 条分类修正。")
+                    _record_last_applied_action(
+                        _travel_scope_name(),
+                        {
+                            "action_id": uuid4().hex,
+                            "action_type": "manual_table",
+                            "summary": f"手工修正分类 {changed} 条",
+                        },
+                    )
+                    st.success(_compose_three_stage_reply("好，我理解了你的修正。", f"我已经应用了 {changed} 条分类调整。", "如果需要，我可以撤销上一步或继续帮你检查缺件。"))
                     st.rerun()
                 else:
                     st.info("没有检测到分类变更。")
 
-    messages = st.session_state.setdefault("travel_agent_messages", [])
-    if not messages:
+    st.markdown("### 待确认修改")
+    pending_actions = [item for item in _get_pending_actions(_travel_scope_name()) if str(item.get("status") or "pending") == "pending"]
+    pleft, pmid, pright = st.columns(3)
+    apply_all = pleft.button("应用全部建议", key="travel_pending_apply_all", use_container_width=True, disabled=not pending_actions)
+    undo_last = pmid.button("撤销上一步", key="travel_pending_undo_last", use_container_width=True)
+    clear_pending = pright.button("清空待确认", key="travel_pending_clear_all", use_container_width=True, disabled=not pending_actions)
+
+    if clear_pending:
+        _clear_pending_actions(_travel_scope_name())
+        st.success("已清空待确认修改。")
+        st.rerun()
+
+    if undo_last:
+        snapshot = _travel_pop_undo_snapshot()
+        if not snapshot:
+            st.info("当前没有可撤销的上一步。")
+        else:
+            assignment, profiles, manual_overrides = _travel_restore_undo_snapshot(snapshot)
+            st.session_state["travel_agent_assignment"] = assignment
+            st.session_state["travel_agent_profiles"] = profiles
+            st.session_state["travel_agent_manual_overrides"] = manual_overrides
+            _clear_last_applied_action(_travel_scope_name())
+            messages.append(
+                {
+                    "role": "assistant",
+                    "content": _compose_three_stage_reply(
+                        "好的，我收到你的撤销请求。",
+                        "我已经恢复到上一步前的差旅分配状态。",
+                        "你可以继续指出具体文件，我会按你的意思重新调整。",
+                    ),
+                }
+            )
+            st.rerun()
+
+    if pending_actions:
+        for action in pending_actions:
+            action_id = str(action.get("action_id") or "")
+            if not action_id:
+                continue
+            with st.container():
+                c1, c2, c3 = st.columns([7, 1, 1])
+                c1.markdown(
+                    f"**{action.get('summary') or '待确认动作'}**  \n"
+                    f"风险：`{action.get('risk_level') or 'medium'}`｜创建时间：`{action.get('created_at') or '-'}"
+                )
+                target_key = f"travel_pending_target_{action_id}"
+                current_target = str(action.get("target") or "")
+                edited_target = c1.text_input("目标值（可改）", value=current_target, key=target_key, label_visibility="collapsed")
+                if edited_target != current_target:
+                    payload = dict(action.get("payload") or {})
+                    if payload.get("command"):
+                        payload["command"] = edited_target
+                    _update_pending_action(_travel_scope_name(), action_id, {"target": edited_target, "payload": payload})
+                    action["target"] = edited_target
+                    action["payload"] = payload
+
+                confirm_clicked = c2.button("确认", key=f"travel_pending_confirm_{action_id}", use_container_width=True)
+                cancel_clicked = c3.button("取消", key=f"travel_pending_cancel_{action_id}", use_container_width=True)
+
+                if cancel_clicked:
+                    _remove_pending_action(_travel_scope_name(), action_id)
+                    st.rerun()
+
+                if confirm_clicked:
+                    _travel_push_undo_snapshot(assignment, profiles, manual_overrides)
+                    ok, msg, assignment, profiles = _travel_execute_pending_action(
+                        action,
+                        pool_list,
+                        assignment,
+                        profiles,
+                        manual_overrides,
+                    )
+                    if ok:
+                        st.session_state["travel_agent_assignment"] = assignment
+                        st.session_state["travel_agent_profiles"] = profiles
+                        _record_last_applied_action(_travel_scope_name(), action)
+                        _remove_pending_action(_travel_scope_name(), action_id)
+                        try:
+                            travel_usecase.learn_from_profiles(profiles, assignment, reason="pending_confirm")
+                        except Exception:
+                            pass
+                        messages.append(
+                            {
+                                "role": "assistant",
+                                "content": _compose_three_stage_reply(
+                                    "好的，我已按你的确认执行。",
+                                    msg,
+                                    "你可以继续让我检查缺件、金额异常，或继续确认剩余建议。",
+                                ),
+                            }
+                        )
+                        st.rerun()
+                    else:
+                        st.warning(msg)
+
+    else:
+        st.info("当前没有待确认动作。高风险指令会先放在这里，确认后再执行。")
+
+    if apply_all and pending_actions:
+        _travel_push_undo_snapshot(assignment, profiles, manual_overrides)
+        success_count = 0
+        failed_lines: list[str] = []
+        for action in list(pending_actions):
+            ok, msg, assignment, profiles = _travel_execute_pending_action(action, pool_list, assignment, profiles, manual_overrides)
+            if ok:
+                success_count += 1
+                _record_last_applied_action(_travel_scope_name(), action)
+                _remove_pending_action(_travel_scope_name(), str(action.get("action_id") or ""))
+            else:
+                failed_lines.append(msg)
+        st.session_state["travel_agent_assignment"] = assignment
+        st.session_state["travel_agent_profiles"] = profiles
+        if success_count > 0:
+            try:
+                travel_usecase.learn_from_profiles(profiles, assignment, reason="pending_apply_all")
+            except Exception:
+                pass
+        summary = f"已批量执行 {success_count} 条待确认动作。"
+        if failed_lines:
+            summary += "\n" + "\n".join(f"- {line}" for line in failed_lines[:4])
         messages.append(
             {
                 "role": "assistant",
-                "content": "我已进入差旅材料整理模式。你可以问我：还缺什么、哪里金额不一致、当前是怎么分配的。",
+                "content": _compose_three_stage_reply(
+                    "好的，我已经处理你的批量确认。",
+                    summary,
+                    "你可以继续微调分类，或直接导出当前结果。",
+                ),
             }
         )
+        st.rerun()
 
     for message in messages:
         with st.chat_message(message.get("role", "assistant")):
@@ -2342,60 +3586,155 @@ def _render_travel_conversation_agent() -> dict[str, Any]:
     user_input = st.chat_input("例如：我现在还缺什么？", key="travel_agent_chat_input")
     if user_input:
         messages.append({"role": "user", "content": user_input})
+        intent = classify_user_message_intent(
+            user_input,
+            {
+                "domain": "travel",
+                "missing_count": len(status.get("missing") or []),
+                "issue_count": len(status.get("issues") or []),
+                "pending_count": len(pending_actions),
+            },
+        )
 
-        # Chat command: force re-recognize selected files.
-        if _is_reclassify_command(user_input):
-            with st.spinner("正在重新识别指定材料..."):
-                recheck_count, recheck_lines, recheck_error = _apply_reclassify_from_user_text(
+        if intent.intent_type == "strong_action" and intent.needs_confirmation:
+            action = _travel_build_pending_action_from_text(user_input)
+            if action:
+                messages.append(
+                    {
+                        "role": "assistant",
+                        "content": _compose_three_stage_reply(
+                            "我理解你的意图，这是一个会影响整体结果的操作。",
+                            f"我已把它放进“待确认修改”：{action.get('summary') or '待确认动作'}。",
+                            "你可以在待确认区逐条确认，或者点“应用全部建议”。",
+                        ),
+                    }
+                )
+                st.rerun()
+
+        if intent.intent_type == "light_edit":
+            _travel_push_undo_snapshot(assignment, profiles, manual_overrides)
+            with st.spinner("正在应用轻量修正..."):
+                recheck_count, _, recheck_error = _apply_reclassify_from_user_text(
                     user_input,
                     profiles,
                     manual_overrides=manual_overrides,
                 )
             if recheck_error:
-                messages.append({"role": "assistant", "content": recheck_error})
+                messages.append(
+                    {
+                        "role": "assistant",
+                        "content": _compose_three_stage_reply(
+                            "我看到了你的修正意图。",
+                            f"这次还没执行成功：{recheck_error}",
+                            "你可以换一个更完整的文件名，或让我先展示当前分配给你确认。",
+                        ),
+                    }
+                )
                 st.rerun()
-            if recheck_count > 0:
+
+            changed_count, changed_names, target_doc_type = _apply_manual_relabel_from_user_text(user_input, profiles)
+            amount_changed_count, amount_changed_names, manual_amount, amount_error = _apply_manual_amount_from_user_text(
+                user_input, profiles
+            )
+            if amount_error:
+                messages.append(
+                    {
+                        "role": "assistant",
+                        "content": _compose_three_stage_reply(
+                            "我看到了你在改金额。",
+                            amount_error,
+                            "你可以直接写“文件名 金额是 746”，我会立刻写回并重新核对金额差异。",
+                        ),
+                    }
+                )
+                st.rerun()
+
+            total_changed = int(recheck_count) + int(changed_count) + int(amount_changed_count)
+            if total_changed > 0:
+                _remember_manual_overrides(manual_overrides, profiles)
                 assignment = _build_assignment_from_profiles(profiles)
                 status = _build_travel_agent_status(assignment)
                 st.session_state["travel_agent_assignment"] = assignment
                 st.session_state["travel_agent_profiles"] = profiles
-                preview = "\n".join(f"- {line}" for line in recheck_lines[:8])
-                if len(recheck_lines) > 8:
-                    preview += f"\n- ... 共 {len(recheck_lines)} 个文件"
-                reply = (
-                    f"已重新识别 {recheck_count} 个文件：\n{preview}\n\n"
-                    f"当前仍缺：{'、'.join(status.get('missing', [])) if status.get('missing') else '无'}。"
+                try:
+                    travel_usecase.learn_from_profiles(profiles, assignment, reason="manual_chat")
+                except Exception:
+                    pass
+                changed_preview = "、".join(changed_names[:3]) if changed_names else ""
+                if changed_count > 3:
+                    changed_preview += f" 等{changed_count}个文件"
+                change_text = f"我已完成 {total_changed} 项轻量修正。"
+                if changed_preview:
+                    change_text += f" 主要调整：{changed_preview}。"
+                if target_doc_type:
+                    change_text += f" 目标类型：{_doc_type_label(str(target_doc_type))}。"
+                if amount_changed_count > 0:
+                    amount_preview = "、".join(amount_changed_names[:3]) if amount_changed_names else ""
+                    if amount_changed_count > 3:
+                        amount_preview += f" 等{amount_changed_count}个文件"
+                    change_text += (
+                        f" 已把 {amount_changed_count} 份材料金额修正为 {_format_amount(manual_amount)}"
+                        + (f"（{amount_preview}）" if amount_preview else "")
+                        + "。"
+                    )
+                _record_last_applied_action(
+                    _travel_scope_name(),
+                    {
+                        "action_id": uuid4().hex,
+                        "action_type": "travel_light_edit",
+                        "summary": f"轻修正 {total_changed} 项",
+                    },
                 )
-                messages.append({"role": "assistant", "content": reply})
+                messages.append(
+                    {
+                        "role": "assistant",
+                        "content": _compose_three_stage_reply(
+                            "明白，这类修正我可以直接处理。",
+                            change_text,
+                            "如需恢复，我可以撤销刚才的修改；也可以继续帮你检查缺件和金额核对。",
+                        ),
+                    }
+                )
+                st.rerun()
+            else:
+                messages.append(
+                    {
+                        "role": "assistant",
+                        "content": (
+                            "我理解你的修正意图，但这次没有产生实际变更。"
+                            "可能是这些文件当前已经是目标类型。"
+                            "你可以让我先列出这些文件的当前类型，我再按你的要求逐条改。"
+                        ),
+                    }
+                )
                 st.rerun()
 
-        changed_count, changed_names, target_doc_type = _apply_manual_relabel_from_user_text(user_input, profiles)
-        if changed_count > 0:
-            _remember_manual_overrides(manual_overrides, profiles)
-            assignment = _build_assignment_from_profiles(profiles)
-            status = _build_travel_agent_status(assignment)
-            st.session_state["travel_agent_assignment"] = assignment
-            st.session_state["travel_agent_profiles"] = profiles
-            travel_usecase.learn_from_profiles(profiles, assignment, reason="manual_chat")
-            changed_preview = "、".join(changed_names[:3])
-            if changed_count > 3:
-                changed_preview += f" 等{changed_count}个文件"
-            reply = (
-                f"已按你的指令修正分类为 `{_doc_type_label(str(target_doc_type or 'unknown'))}`：{changed_preview}。\n\n"
-                f"当前仍缺：{'、'.join(status.get('missing', [])) if status.get('missing') else '无'}。"
+        if intent.intent_type == "ambiguous":
+            summary = (
+                f"当前已识别 {len(profiles)} 份材料，缺件 {len(status.get('missing') or [])} 项，"
+                f"异常 {len(status.get('issues') or [])} 项。"
             )
-            messages.append({"role": "assistant", "content": reply})
+            messages.append(
+                {
+                    "role": "assistant",
+                    "content": _compose_three_stage_reply(
+                        "我理解你觉得结果有点不对。",
+                        summary,
+                        "你可以告诉我具体文件名和目标类型（例如“某某.jpg 是机票明细”），我会先给出调整再请你确认。",
+                    ),
+                }
+            )
             st.rerun()
 
         reply = _generate_travel_agent_reply_llm(user_input, assignment, status, profiles, messages)
         if not reply:
-            reply = (
-                "LLM 当前未返回有效结果。请检查本地 Ollama 服务与模型状态：\n"
-                "- `ollama ps` 是否有正在运行模型\n"
-                "- `OLLAMA_BASE_URL` 与端口是否正确\n"
-                "- 可设置 `OLLAMA_TEXT_MODEL` / `OLLAMA_CHAT_MODEL` 为稳定文本模型后重试"
-            )
-        messages.append({"role": "assistant", "content": reply})
+            reply = _generate_travel_agent_reply_rule(user_input, assignment, status, profiles)
+        messages.append(
+            {
+                "role": "assistant",
+                "content": str(reply or "").strip(),
+            }
+        )
         st.rerun()
 
     return status
@@ -2720,6 +4059,29 @@ def _material_agent_quality_hints(fields: dict[str, Any]) -> list[str]:
             if len(hints) >= 4:
                 break
     return hints
+
+
+def _build_material_handoff_status_reply(
+    *,
+    task: Any,
+    rows: list[dict[str, Any]],
+    amount_value: float | None,
+    row_total: float | None,
+    quality_hints: list[str],
+    guide_files: list[Any],
+    guide_payload: dict[str, Any],
+) -> str:
+    missing_text = _short_join_items(
+        list((guide_payload or {}).get("missing_items") or []),
+        limit=3,
+        empty_text="暂无明显缺件",
+    )
+    risk_text = _short_join_items(quality_hints, limit=2, empty_text="暂无明显质量风险")
+    return _compose_three_stage_reply(
+        f"已接收首页带入的 {len(_as_uploaded_list(guide_files))} 份材料，当前任务：{getattr(task, 'original_filename', '')}。",
+        f"已抽取明细 {len(rows)} 行；发票总额 {_format_amount(amount_value)}，明细合计 {_format_amount(row_total)}。缺件提示：{missing_text}。风险提示：{risk_text}。",
+        "你可以直接问“哪些行有问题”或给我修改指令（例如“第2行规格改为...”），我会马上处理。",
+    )
 
 
 def _material_agent_split_name_spec(name: str, spec: str) -> tuple[str, str]:
@@ -3234,6 +4596,73 @@ def _material_agent_recent_changes_text(task_id: str, limit: int = 5) -> str:
     return "最近变更：\n" + "\n".join(parts)
 
 
+def _material_scope_name(task_id: str) -> str:
+    return f"material_agent_{task_id}"
+
+
+def _material_build_pending_action_from_text(user_text: str, task, fields: dict[str, Any]) -> dict[str, Any] | None:
+    text = str(user_text or "").strip()
+    if not text:
+        return None
+
+    if any(token in text for token in ["导出报销表", "导出结果", "导出excel", "导出 excel"]):
+        return _append_pending_action(
+            _material_scope_name(task.id),
+            action_type="material_export",
+            summary="确认导出当前材料费结果",
+            target="当前任务导出",
+            risk_level="high",
+            payload={"command": text},
+        )
+
+    if any(token in text for token in ["应用全部修正", "应用全部建议", "覆盖当前结果", "覆盖当前分配结果"]):
+        return _append_pending_action(
+            _material_scope_name(task.id),
+            action_type="material_apply_all",
+            summary="批量应用当前材料费待确认建议",
+            target="当前任务全部待确认动作",
+            risk_level="high",
+            payload={"command": text},
+        )
+
+    if any(token in text for token in ["智能修复", "重新识别", "应用llm修复表", "应用llm结果", "应用对比结果"]):
+        return _append_pending_action(
+            _material_scope_name(task.id),
+            action_type="material_command",
+            summary="执行一条高影响材料费调整",
+            target=text[:120],
+            risk_level="high",
+            payload={"command": text},
+        )
+
+    return _append_pending_action(
+        _material_scope_name(task.id),
+        action_type="material_command",
+        summary="执行一条待确认材料费调整",
+        target=text[:120],
+        risk_level="medium",
+        payload={"command": text},
+    )
+
+
+def _material_execute_pending_action(action: dict[str, Any], task, fields: dict[str, Any]) -> tuple[bool, str, Any, dict[str, Any]]:
+    action_type = str(action.get("action_type") or "").strip()
+    if action_type == "material_export":
+        st.session_state[f"material_export_confirmed_{task.id}"] = True
+        return True, "已确认导出。你可以直接使用下方“下载Excel/下载文本”。", task, fields
+
+    command = str((action.get("payload") or {}).get("command") or action.get("target") or "").strip()
+    if action_type == "material_apply_all":
+        command = "应用LLM修复表"
+    if not command:
+        return False, "待确认动作缺少可执行内容。", task, fields
+
+    handled, reply, updated_task, updated_fields = _material_agent_apply_chat_command(command, task, fields)
+    if not handled:
+        return False, "确认后未命中可执行动作，请补充更具体的目标。", task, fields
+    return True, reply, updated_task, updated_fields
+
+
 def _material_agent_build_row_diff(old_rows: list[dict[str, Any]], new_rows: list[dict[str, Any]], max_lines: int = 8) -> list[str]:
     result: list[str] = []
     total = max(len(old_rows), len(new_rows))
@@ -3557,11 +4986,11 @@ def _material_agent_apply_chat_command(
 ) -> tuple[bool, str, Any, dict[str, Any]]:
     text = str(user_text or "").strip()
     if not text:
-        return True, "请给我一个明确指令，例如：`第3行规格改为M20X1.5`。", task, fields
+        return True, "我在。你可以先告诉我哪里看起来不对，我会先解释并给出可执行修改。", task, fields
 
     # Casual chat should not be interpreted as executable actions.
     if _material_agent_is_smalltalk(text):
-        return True, "你好，我在。你可以直接说：`第N行...改为...`、`删除第N行`、`新增一行...`。", task, fields
+        return True, "你好，我在。你可以直接说你的疑问或目标，例如“最后一行规格像混进项目名了”。", task, fields
 
     action_intent = _material_agent_has_action_intent(text)
     if action_intent:
@@ -3721,7 +5150,7 @@ def _material_agent_apply_chat_command(
     if _material_agent_looks_like_edit_intent(text):
         return (
             True,
-            "我没有执行任何修改。请按以下格式重试：`第3行规格改为M20X1.5`、`最后一行项目名称应为... 规格型号应为...`、`删除最后一行`。",
+            "我先不直接改动，避免误操作。你可以告诉我“哪一行、哪个字段、希望改成什么”，我会先给你确认再执行。",
             task,
             fields,
         )
@@ -3828,7 +5257,7 @@ def _generate_material_agent_reply_llm(
 
 def _render_material_conversation_agent() -> None:
     st.subheader("2) 材料费会话式 Agent")
-    st.caption("上传材料费发票后，Agent 自动抽取并生成明细表。支持对话修正与重新识别，修改后会持续学习。")
+    st.caption("上传材料费发票后，Agent 自动抽取并生成明细表。默认对话优先，动作会分级处理。")
 
     uploaded = st.file_uploader(
         "上传材料费发票（PDF，可多选）",
@@ -3836,7 +5265,21 @@ def _render_material_conversation_agent() -> None:
         accept_multiple_files=True,
         key="material_agent_upload_files",
     )
-    upload_list = _as_uploaded_list(uploaded)
+    page_uploaded_files = _as_uploaded_list(uploaded)
+    upload_list = list(page_uploaded_files)
+    guide_payload, guide_files = _get_guide_handoff_for_flow("material")
+    if guide_files:
+        upload_list = _merge_uploaded_lists(upload_list, _as_uploaded_list(guide_files))
+        st.info(f"已从首页引导带入 {len(guide_files)} 份材料，可直接点击“Agent识别材料发票”。")
+        _render_included_file_list(
+            flow_label="材料费流程",
+            page_uploaded_files=page_uploaded_files,
+            guide_files=guide_files,
+            merged_files=upload_list,
+        )
+    if guide_payload:
+        with st.expander("首页引导摘要（已带入）", expanded=False):
+            st.json(guide_payload)
 
     task_ids = st.session_state.setdefault("material_agent_task_ids", [])
     if not isinstance(task_ids, list):
@@ -3849,6 +5292,10 @@ def _render_material_conversation_agent() -> None:
     clear_chat_clicked = action3.button("清空材料会话", use_container_width=True, key="material_agent_clear_chat")
 
     if clear_tasks_clicked:
+        for tid in list(st.session_state.get("material_agent_task_ids", []) or []):
+            st.session_state.pop(_pending_actions_key(_material_scope_name(str(tid))), None)
+            st.session_state.pop(_material_agent_undo_stack_key(str(tid)), None)
+            _clear_last_applied_action(_material_scope_name(str(tid)))
         st.session_state.pop("material_agent_task_ids", None)
         st.session_state.pop("material_agent_chat_map", None)
         st.success("已清空材料任务缓存。")
@@ -3895,6 +5342,8 @@ def _render_material_conversation_agent() -> None:
         return
 
     fields = _material_agent_extract_fields(task)
+    scope = _material_scope_name(task.id)
+    pending_actions = [item for item in _get_pending_actions(scope) if str(item.get("status") or "pending") == "pending"]
     compare_dialog_key = _material_rule_llm_compare_dialog_state_key(task.id)
     if bool(st.session_state.get(compare_dialog_key)):
         _render_material_rule_llm_compare_dialog(task.id)
@@ -3915,13 +5364,77 @@ def _render_material_conversation_agent() -> None:
         for idx, row in enumerate(rows)
     ]
 
-    m1, m2, m3, m4 = st.columns(4)
-    m1.metric("明细行数", len(rows))
-    m2.metric("发票总金额(含税)", _format_amount(amount_value) if amount_value is not None else "-")
-    m3.metric("明细合计", _format_amount(row_total) if row_total is not None else "-")
-    m4.metric("识别模式", str(fields.get("processing_mode") or fields.get("extraction_source") or "default"))
+    chat_map = st.session_state.setdefault("material_agent_chat_map", {})
+    if not isinstance(chat_map, dict):
+        chat_map = {}
+        st.session_state["material_agent_chat_map"] = chat_map
+
+    task_messages = chat_map.setdefault(
+        task.id,
+        [
+            {
+                "role": "assistant",
+                "content": _compose_three_stage_reply(
+                    "我已经接管这张材料费发票。",
+                    "我会持续显示当前状态、风险和待确认动作；默认先解释，不会盲目改数据。",
+                    "你可以先问“这张有什么问题”，也可以说“最后一行规格和项目名混了，帮我拆开”。",
+                ),
+            }
+        ],
+    )
+
+    # 如果已有规则表/LLM表差异，自动生成一条可确认建议，不直接执行。
+    diff_count = _material_agent_rule_llm_diff_count(fields)
+    if diff_count > 0:
+        has_compare_action = any(
+            str((item.get("payload") or {}).get("command") or "") == "应用LLM修复表" for item in pending_actions
+        )
+        if not has_compare_action:
+            _append_pending_action(
+                scope,
+                action_type="material_command",
+                summary=f"建议应用LLM修复结果（检测到 {diff_count} 处差异）",
+                target="应用LLM修复表",
+                risk_level="medium",
+                payload={"command": "应用LLM修复表"},
+            )
+            pending_actions = [item for item in _get_pending_actions(scope) if str(item.get("status") or "pending") == "pending"]
+
+    st.markdown("### 当前任务状态")
+    m1, m2, m3, m4, m5, m6 = st.columns(6)
+    m1.metric("任务类型", "材料费")
+    m2.metric("明细行数", len(rows))
+    m3.metric("发票总金额(含税)", _format_amount(amount_value) if amount_value is not None else "-")
+    m4.metric("明细合计", _format_amount(row_total) if row_total is not None else "-")
+    m5.metric("待确认动作", len(pending_actions))
+    m6.metric("识别模式", str(fields.get("processing_mode") or fields.get("extraction_source") or "default"))
 
     quality_hints = _material_agent_quality_hints(fields)
+    if guide_files or guide_payload:
+        token_map = st.session_state.setdefault("material_agent_handoff_summary_token_map", {})
+        if not isinstance(token_map, dict):
+            token_map = {}
+            st.session_state["material_agent_handoff_summary_token_map"] = token_map
+        handoff_token = (
+            f"material|{task.id}|{str(st.session_state.get('guide_handoff_entered_at') or '')}"
+            f"|{len(_as_uploaded_list(guide_files))}"
+        )
+        if str(token_map.get(task.id) or "") != handoff_token:
+            task_messages.append(
+                {
+                    "role": "assistant",
+                    "content": _build_material_handoff_status_reply(
+                        task=task,
+                        rows=rows,
+                        amount_value=amount_value,
+                        row_total=row_total,
+                        quality_hints=quality_hints,
+                        guide_files=guide_files,
+                        guide_payload=guide_payload,
+                    ),
+                }
+            )
+            token_map[task.id] = handoff_token
     if quality_hints:
         st.warning("发现质量风险：")
         for hint in quality_hints:
@@ -3971,7 +5484,135 @@ def _render_material_conversation_agent() -> None:
     else:
         st.session_state.pop(_material_review_dialog_state_key(task.id), None)
 
+    with st.expander("任务工作台：分类与异常摘要", expanded=False):
+        slot_like = {
+            "项目名称为空": sum(1 for row in rows if not str(row.get("item_name") or "").strip()),
+            "规格为空": sum(1 for row in rows if not str(row.get("spec") or "").strip()),
+            "数量为空": sum(1 for row in rows if not str(row.get("quantity") or "").strip()),
+            "金额为空": sum(1 for row in rows if not str(row.get("line_total_with_tax") or "").strip()),
+        }
+        st.dataframe(
+            [{"项": key, "数量": value} for key, value in slot_like.items()],
+            use_container_width=True,
+            hide_index=True,
+        )
+        if quality_hints:
+            st.markdown("**异常提示**")
+            for hint in quality_hints[:8]:
+                st.markdown(f"- {hint}")
+        else:
+            st.markdown("**异常提示**\n- 当前未发现明显异常。")
+
     st.dataframe(display_rows_cn, use_container_width=True, hide_index=True)
+
+    st.markdown("### 待确认修改")
+    pa1, pa2, pa3 = st.columns(3)
+    apply_all_pending = pa1.button("应用全部建议", key=f"material_pending_apply_all_{task.id}", use_container_width=True, disabled=not pending_actions)
+    undo_last = pa2.button("撤销上一步", key=f"material_pending_undo_{task.id}", use_container_width=True)
+    clear_pending = pa3.button("清空待确认", key=f"material_pending_clear_{task.id}", use_container_width=True, disabled=not pending_actions)
+
+    if clear_pending:
+        _clear_pending_actions(scope)
+        st.success("已清空待确认修改。")
+        st.rerun()
+
+    if undo_last:
+        handled, reply, updated_task, updated_fields = _material_agent_apply_chat_command("撤销上一步", task, fields)
+        if handled:
+            _clear_last_applied_action(scope)
+            task_messages.append(
+                {
+                    "role": "assistant",
+                    "content": _compose_three_stage_reply(
+                        "好的，我理解你要回退刚才的修改。",
+                        reply,
+                        "你可以继续指出要调整的行，或让我先解释当前风险点。",
+                    ),
+                }
+            )
+            task = updated_task or task
+            fields = updated_fields or fields
+            st.rerun()
+        else:
+            st.info("当前没有可撤销的上一步。")
+
+    if pending_actions:
+        for action in pending_actions:
+            action_id = str(action.get("action_id") or "")
+            if not action_id:
+                continue
+            with st.container():
+                c1, c2, c3 = st.columns([7, 1, 1])
+                c1.markdown(
+                    f"**{action.get('summary') or '待确认动作'}**  \n"
+                    f"风险：`{action.get('risk_level') or 'medium'}`｜创建时间：`{action.get('created_at') or '-'}"
+                )
+                target_key = f"material_pending_target_{task.id}_{action_id}"
+                current_target = str(action.get("target") or "")
+                edited_target = c1.text_input("目标值（可改）", value=current_target, key=target_key, label_visibility="collapsed")
+                if edited_target != current_target:
+                    payload = dict(action.get("payload") or {})
+                    if payload.get("command"):
+                        payload["command"] = edited_target
+                    _update_pending_action(scope, action_id, {"target": edited_target, "payload": payload})
+                    action["target"] = edited_target
+                    action["payload"] = payload
+
+                confirm_clicked = c2.button("确认", key=f"material_pending_confirm_{task.id}_{action_id}", use_container_width=True)
+                cancel_clicked = c3.button("取消", key=f"material_pending_cancel_{task.id}_{action_id}", use_container_width=True)
+                if cancel_clicked:
+                    _remove_pending_action(scope, action_id)
+                    st.rerun()
+                if confirm_clicked:
+                    ok, msg, updated_task, updated_fields = _material_execute_pending_action(action, task, fields)
+                    if not ok:
+                        st.warning(msg)
+                    else:
+                        _record_last_applied_action(scope, action)
+                        _remove_pending_action(scope, action_id)
+                        task = updated_task or task
+                        fields = updated_fields or fields
+                        task_messages.append(
+                            {
+                                "role": "assistant",
+                                "content": _compose_three_stage_reply(
+                                    "好的，我已按你的确认执行。",
+                                    msg,
+                                    "如果你希望，我可以继续检查漏项和名称/规格混杂风险。",
+                                ),
+                            }
+                        )
+                        st.rerun()
+    else:
+        st.info("当前没有待确认动作。高风险操作会先放在这里，确认后再执行。")
+
+    if apply_all_pending and pending_actions:
+        success_count = 0
+        failed_lines: list[str] = []
+        for action in list(pending_actions):
+            ok, msg, updated_task, updated_fields = _material_execute_pending_action(action, task, fields)
+            if ok:
+                success_count += 1
+                _record_last_applied_action(scope, action)
+                _remove_pending_action(scope, str(action.get("action_id") or ""))
+                task = updated_task or task
+                fields = updated_fields or fields
+            else:
+                failed_lines.append(msg)
+        summary = f"已批量应用 {success_count} 条建议。"
+        if failed_lines:
+            summary += "\n" + "\n".join(f"- {line}" for line in failed_lines[:5])
+        task_messages.append(
+            {
+                "role": "assistant",
+                "content": _compose_three_stage_reply(
+                    "我已经收到你的批量确认。",
+                    summary,
+                    "你可以继续微调具体行，或者直接导出当前结果。",
+                ),
+            }
+        )
+        st.rerun()
 
     if st.button("智能修复对比（规则 vs LLM）", use_container_width=True, key=f"material_agent_llm_compare_{task.id}"):
         latest_task = material_usecase.get_task(task.id) or task
@@ -3995,55 +5636,156 @@ def _render_material_conversation_agent() -> None:
         else:
             st.error("暂未生成可对比的规则表/LLM表。")
 
+    st.markdown("### 工作台操作")
+    op1, op2, op3 = st.columns(3)
+    if op1.button("应用全部建议（待确认）", key=f"material_apply_all_shortcut_{task.id}", use_container_width=True, disabled=not pending_actions):
+        pending_now = [item for item in _get_pending_actions(scope) if str(item.get("status") or "pending") == "pending"]
+        success_count = 0
+        failed_lines: list[str] = []
+        for action in list(pending_now):
+            ok, msg, updated_task, updated_fields = _material_execute_pending_action(action, task, fields)
+            if ok:
+                success_count += 1
+                _record_last_applied_action(scope, action)
+                _remove_pending_action(scope, str(action.get("action_id") or ""))
+                task = updated_task or task
+                fields = updated_fields or fields
+            else:
+                failed_lines.append(msg)
+        summary = f"已批量应用 {success_count} 条建议。"
+        if failed_lines:
+            summary += "\n" + "\n".join(f"- {line}" for line in failed_lines[:5])
+        task_messages.append(
+            {
+                "role": "assistant",
+                "content": _compose_three_stage_reply(
+                    "好的，我已执行工作台批量应用。",
+                    summary,
+                    "你可以继续让我解释异常，或直接导出结果。",
+                ),
+            }
+        )
+        st.rerun()
+    if op2.button("撤销上一步（快捷）", key=f"material_undo_shortcut_{task.id}", use_container_width=True):
+        handled, reply, updated_task, updated_fields = _material_agent_apply_chat_command("撤销上一步", task, fields)
+        if handled:
+            task_messages.append(
+                {
+                    "role": "assistant",
+                    "content": _compose_three_stage_reply(
+                        "好的，我收到撤销请求。",
+                        reply,
+                        "你可以继续指出要修改的行，或让我先解释当前结果。",
+                    ),
+                }
+            )
+            task = updated_task or task
+            fields = updated_fields or fields
+            st.rerun()
+        st.info("当前没有可撤销记录。")
+    op3.caption("导出请使用下方“下载Excel/下载文本”。")
+
     _render_export_download(task, key_scope="material_agent")
 
     with st.expander("查看抽取结果(JSON)", expanded=False):
         st.json(task.extracted_data or {})
 
-    chat_map = st.session_state.setdefault("material_agent_chat_map", {})
-    if not isinstance(chat_map, dict):
-        chat_map = {}
-        st.session_state["material_agent_chat_map"] = chat_map
-
-    task_messages = chat_map.setdefault(
-        task.id,
-        [
-            {
-                "role": "assistant",
-                "content": (
-                    "已进入材料费整理模式。你可以直接说：`第3行规格改为M20X1.5`、`删除第5行`、"
-                    "`新增一行 项目名称=... 规格=... 数量=... 单位=... 金额=...`、`重新识别`、`智能修复`、"
-                    "`打开对比`、`应用LLM修复表`、`撤销上一步`、`查看最近变更`，"
-                    "或点“智能修复对比（规则 vs LLM）”。"
-                ),
-            }
-        ],
-    )
-
     for message in task_messages:
         with st.chat_message(message.get("role", "assistant")):
             st.markdown(str(message.get("content", "")))
 
-    user_input = st.chat_input("例如：第2行规格改为Y50EX-1208TK2+", key=f"material_agent_chat_input_{task.id}")
+    user_input = st.chat_input(
+        "直接说你的问题或修改意图（例如：最后一行规格和项目名混了）",
+        key=f"material_agent_chat_input_{task.id}",
+    )
     if user_input:
         task_messages.append({"role": "user", "content": user_input})
-        handled, reply, updated_task, _ = _material_agent_apply_chat_command(user_input, task, fields)
-        if handled:
-            task_messages.append({"role": "assistant", "content": reply})
+        intent = classify_user_message_intent(
+            user_input,
+            {
+                "domain": "material",
+                "line_count": len(rows),
+                "pending_count": len(pending_actions),
+                "quality_hint_count": len(quality_hints),
+            },
+        )
+
+        if intent.intent_type == "strong_action" and intent.needs_confirmation:
+            action = _material_build_pending_action_from_text(user_input, task, fields)
+            if action:
+                task_messages.append(
+                    {
+                        "role": "assistant",
+                        "content": _compose_three_stage_reply(
+                            "我理解你的操作意图，这一步影响范围较大。",
+                            f"我已把它放入待确认区：{action.get('summary') or '待确认动作'}。",
+                            "你可以在“待确认修改”里逐条确认，或点“应用全部建议”。",
+                        ),
+                    }
+                )
+                st.rerun()
+
+        if intent.intent_type == "light_edit":
+            handled, reply, updated_task, updated_fields = _material_agent_apply_chat_command(user_input, task, fields)
+            if handled:
+                _record_last_applied_action(
+                    scope,
+                    {
+                        "action_id": uuid4().hex,
+                        "action_type": "material_light_edit",
+                        "summary": str(reply or "轻量修正"),
+                    },
+                )
+                task_messages.append(
+                    {
+                        "role": "assistant",
+                        "content": _compose_three_stage_reply(
+                            "好的，我已经理解并执行了这条轻量修正。",
+                            str(reply or "已更新当前表格。"),
+                            "如需恢复，我可以撤销刚才的修改；也可以继续帮你检查剩余风险。",
+                        ),
+                    }
+                )
+                task = updated_task or task
+                fields = updated_fields or fields
+                st.rerun()
+
+        if intent.intent_type == "ambiguous":
+            task_messages.append(
+                {
+                    "role": "assistant",
+                    "content": _compose_three_stage_reply(
+                        "我理解你在表达“结果可能不太对”。",
+                        f"目前明细 {len(rows)} 行，质量提示 {len(quality_hints)} 条，待确认动作 {len(pending_actions)} 条。",
+                        "你可以告诉我具体行号和字段（如“第5行规格改为...”），或者让我先解释风险最高的几行。",
+                    ),
+                }
+            )
             st.rerun()
 
         llm_reply = _generate_material_agent_reply_llm(user_input, task, fields, task_messages)
         if not llm_reply:
-            llm_reply = "当前未获得有效LLM回复。你可以直接使用结构化指令修改表格，例如：`删除第3行`。"
-        task_messages.append({"role": "assistant", "content": llm_reply})
+            llm_reply = "我先解释当前判断，不会直接改数据。你可以继续追问原因，或告诉我希望改成什么。"
+        task_messages.append(
+            {
+                "role": "assistant",
+                "content": _compose_three_stage_reply(
+                    "收到，我先按对话方式给你解释。",
+                    llm_reply,
+                    "如果你希望我执行修改，我会先判断风险：低风险可直接改，高风险先进入待确认区。",
+                ),
+            }
+        )
         st.rerun()
 
 
 def _render_material_flow() -> None:
+    _render_flow_back_to_home("material")
     _render_material_conversation_agent()
 
 
 def _render_travel_flow() -> None:
+    _render_flow_back_to_home("travel")
     st.subheader("差旅费流程")
     st.caption("差旅流程提供会话式 Agent 自动整理，也支持手工槽位补录；可导出标准归档压缩包。")
     st.markdown(
@@ -4067,23 +5809,43 @@ def _render_travel_flow() -> None:
 
 def main() -> None:
     st.set_page_config(page_title="Finance Agent", layout="wide")
+    _inject_ui_styles()
     st.title("财务 Agent（本地工具版）")
-    st.caption("按费用类型选择流程：材料费 / 差旅费")
+    st.caption("首页引导优先：先聊天与预检查，再自动进入差旅/材料正式流程。")
 
     material_usecase.init_app_runtime()
+    _ensure_router_state()
     _render_model_runtime_panel()
+    flash_message = _pop_router_flash_message()
+    if flash_message:
+        st.success(flash_message)
 
-    flow_mode = st.radio(
-        "选择报销流程",
-        options=["材料费流程", "差旅费流程"],
-        horizontal=True,
-    )
-    st.divider()
-
-    if flow_mode == "材料费流程":
+    current_page = str(st.session_state.get("current_page") or PAGE_HOME_GUIDE)
+    if current_page == PAGE_HOME_GUIDE:
+        _render_home_guide_agent()
+        st.divider()
+        with st.expander("兼容入口：手动进入正式流程（可选）", expanded=False):
+            if "flow_mode_selector" not in st.session_state:
+                st.session_state["flow_mode_selector"] = "材料费流程"
+            flow_mode = st.radio(
+                "选择报销流程",
+                options=["材料费流程", "差旅费流程"],
+                horizontal=True,
+                key="flow_mode_selector",
+            )
+            if st.button("进入所选流程", use_container_width=True, key="legacy_enter_selected_flow"):
+                if flow_mode == "差旅费流程":
+                    _set_current_page(PAGE_TRAVEL_FLOW, flash_message="已进入差旅正式流程。")
+                else:
+                    _set_current_page(PAGE_MATERIAL_FLOW, flash_message="已进入材料费正式流程。")
+                st.rerun()
+    elif current_page == PAGE_MATERIAL_FLOW:
         _render_material_flow()
-    else:
+    elif current_page == PAGE_TRAVEL_FLOW:
         _render_travel_flow()
+    else:
+        _set_current_page(PAGE_HOME_GUIDE)
+        st.rerun()
 
 
 if __name__ == "__main__":

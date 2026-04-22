@@ -199,27 +199,52 @@ def learn_from_travel_profiles(
         source = str(profile.get("source") or "").strip()
         evidence = _safe_text(profile.get("evidence"))
         file_name = _safe_text(profile.get("name"))
+        file_sha1 = _safe_text(profile.get("file_sha1"))
+        signal_text = _safe_text(profile.get("signal_text"))
+        ocr_text = _safe_text(profile.get("ocr_text"))
+        raw_text = _safe_text(profile.get("raw_text"))
 
         compact_rows.append(f"{file_name}|{doc_type}|{slot}|{amount}|{date}")
         if not source.startswith("manual"):
             continue
 
+        signal_merged = "\n".join(part for part in [signal_text, ocr_text, raw_text] if part).strip()
+        if len(signal_merged) > 1800:
+            signal_merged = signal_merged[:1800]
+
         row_text = (
-            f"doc_type: {doc_type}\nslot: {slot}\namount: {amount}\n"
-            f"date: {date}\nevidence: {evidence}\nreason: {reason}"
+            f"file_name: {file_name}\n"
+            f"file_sha1: {file_sha1}\n"
+            f"doc_type: {doc_type}\n"
+            f"slot: {slot}\n"
+            f"amount: {amount}\n"
+            f"date: {date}\n"
+            f"evidence: {evidence}\n"
+            f"reason: {reason}\n"
+            f"signal_text: {signal_merged}"
         )
-        row_sig = _signature(f"{file_name}|{row_text}")
+        row_sig = _signature(f"{file_name}|{file_sha1}|{row_text}")
+        if file_sha1:
+            doc_key = f"travel_case:filehash:{file_sha1}"
+            source_id = file_sha1
+        else:
+            doc_key = f"travel_case:file:{row_sig}"
+            source_id = row_sig
         documents.append(
             {
-                "doc_key": f"travel_case:file:{row_sig}",
-                "source_id": row_sig,
+                "doc_key": doc_key,
+                "source_id": source_id,
                 "title": f"travel_file_case_{file_name}",
                 "content": row_text,
                 "metadata": {
+                    "case_kind": "file_doc_type",
+                    "file_name": file_name,
+                    "file_sha1": file_sha1,
                     "doc_type": doc_type,
                     "slot": slot,
                     "source": source,
                     "reason": reason,
+                    "signal_text": signal_merged,
                 },
             }
         )
@@ -246,7 +271,7 @@ def learn_from_travel_profiles(
             "source_id": session_sig,
             "title": f"travel_session_case_{session_sig}",
             "content": summary_text,
-            "metadata": {"reason": reason, "profile_count": len(profiles)},
+            "metadata": {"case_kind": "session_summary", "reason": reason, "profile_count": len(profiles)},
         }
     )
 

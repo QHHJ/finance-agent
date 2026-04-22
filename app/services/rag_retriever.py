@@ -71,13 +71,18 @@ def retrieve_material_fix_case_hits(query: str, top_k: int | None = None) -> lis
     return retrieve_material_case_hits(query=query, top_k=k)
 
 
-def retrieve_travel_case_hits(query: str, top_k: int | None = None) -> list[dict[str, Any]]:
+def retrieve_travel_case_hits(
+    query: str,
+    top_k: int | None = None,
+    metadata_filter: dict[str, Any] | None = None,
+) -> list[dict[str, Any]]:
     retriever = get_retriever()
     return retriever.query_documents(
         query=query,
         source_types=["travel_case"],
         top_k=top_k or _top_k(4, "RAG_TRAVEL_CASE_TOP_K"),
         min_score=float(os.getenv("RAG_CASE_MIN_SCORE", "0.16")),
+        metadata_filter=metadata_filter,
     )
 
 
