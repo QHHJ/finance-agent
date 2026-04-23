@@ -1,0 +1,9 @@
+{"sample_id":"travel_demo_001","batch_id":"trip_demo_001","batch_order":1,"file_path":"data/uploads/example_go_ticket.pdf","expected_doc_type":"transport_ticket","expected_slot":"go_ticket","note":"去程交通票据"}
+{"sample_id":"travel_demo_002","batch_id":"trip_demo_001","batch_order":2,"file_path":"data/uploads/example_go_payment.png","expected_doc_type":"transport_payment","expected_slot":"go_payment","note":"去程支付记录"}
+{"sample_id":"travel_demo_003","batch_id":"trip_demo_001","batch_order":3,"file_path":"data/uploads/example_go_detail.pdf","expected_doc_type":"flight_detail","expected_slot":"go_detail","note":"去程机票明细"}
+{"sample_id":"travel_demo_004","batch_id":"trip_demo_001","batch_order":4,"file_path":"data/uploads/example_return_ticket.pdf","expected_doc_type":"transport_ticket","expected_slot":"return_ticket","note":"返程交通票据"}
+{"sample_id":"travel_demo_005","batch_id":"trip_demo_001","batch_order":5,"file_path":"data/uploads/example_return_payment.png","expected_doc_type":"transport_payment","expected_slot":"return_payment","note":"返程支付记录"}
+{"sample_id":"travel_demo_006","batch_id":"trip_demo_001","batch_order":6,"file_path":"data/uploads/example_return_detail.pdf","expected_doc_type":"flight_detail","expected_slot":"return_detail","note":"返程机票明细"}
+{"sample_id":"travel_demo_007","batch_id":"trip_demo_001","batch_order":7,"file_path":"data/uploads/example_hotel_invoice.pdf","expected_doc_type":"hotel_invoice","expected_slot":"hotel_invoice","note":"酒店发票"}
+{"sample_id":"travel_demo_008","batch_id":"trip_demo_001","batch_order":8,"file_path":"data/uploads/example_hotel_payment.png","expected_doc_type":"hotel_payment","expected_slot":"hotel_payment","note":"酒店支付记录"}
+{"sample_id":"travel_demo_009","batch_id":"trip_demo_001","batch_order":9,"file_path":"data/uploads/example_hotel_order.png","expected_doc_type":"hotel_order","expected_slot":"hotel_order","note":"酒店订单截图"}

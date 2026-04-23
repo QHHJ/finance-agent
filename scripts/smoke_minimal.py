@@ -24,6 +24,7 @@ class SmokeSummary:
     sqlite_hits: int
     faiss_hits: int
     graph_routes: dict[str, str]
+    keyword_checks: dict[str, int]
 
 
 def _assert(condition: bool, message: str) -> None:
@@ -51,7 +52,9 @@ def run_usecase_smoke() -> tuple[str, str, str]:
 
     now = datetime.now().strftime("%Y%m%d_%H%M%S")
     filename = f"smoke_material_{now}.pdf"
-    pdf_bytes = _build_minimal_pdf_bytes("材料费 smoke test 机票 酒店 入库")
+    pdf_bytes = _build_minimal_pdf_bytes(
+        "\u6750\u6599\u8d39 smoke test \u53d1\u7968 \u5165\u5e93 \u89c4\u683c \u6570\u91cf"
+    )
 
     task = task_ops.create_and_process_task(filename, pdf_bytes, auto_process=True, auto_export=True)
     _assert(task is not None, "create_and_process_task returned None")
@@ -65,20 +68,20 @@ def run_usecase_smoke() -> tuple[str, str, str]:
     if not extracted["line_items"]:
         extracted["line_items"] = [
             {
-                "item_name": "烟雾测试项目",
+                "item_name": "\u70df\u96fe\u6d4b\u8bd5\u9879\u76ee",
                 "spec": "SMOKE-1",
                 "quantity": "1",
-                "unit": "件",
+                "unit": "\u4ef6",
                 "line_total_with_tax": "100.00",
             }
         ]
     extracted["amount"] = str(extracted.get("amount") or "100.00")
-    extracted["bill_type"] = str(extracted.get("bill_type") or "增值税普通发票")
+    extracted["bill_type"] = str(extracted.get("bill_type") or "\u589e\u503c\u7a0e\u666e\u901a\u53d1\u7968")
 
     corrected = task_ops.apply_corrections(
         latest.id,
         {
-            "expense_category": "材料费",
+            "expense_category": "\u6750\u6599\u8d39",
             "extracted_fields": extracted,
         },
     )
@@ -97,7 +100,7 @@ def run_usecase_smoke() -> tuple[str, str, str]:
 def run_retrieval_smoke() -> tuple[int, int]:
     from app.retrieval.factory import clear_retriever_cache, get_retriever, rebuild_faiss_index
 
-    payload_text = "差旅 报销 机票 酒店 材料 规则 smoke"
+    payload_text = "\u5dee\u65c5 \u62a5\u9500 \u673a\u7968 \u9152\u5e97 \u6750\u6599 \u89c4\u5219 smoke"
 
     def _one_backend(backend: str) -> int:
         clear_retriever_cache()
@@ -118,7 +121,7 @@ def run_retrieval_smoke() -> tuple[int, int]:
         )
         _assert(inserted >= 1, f"{backend} upsert failed")
         hits = retriever.query_documents(
-            query="机票 报销 酒店",
+            query="\u673a\u7968 \u62a5\u9500 \u9152\u5e97",
             source_types=["travel_case"],
             top_k=5,
             min_score=-1.0,
@@ -129,7 +132,6 @@ def run_retrieval_smoke() -> tuple[int, int]:
         return len(hits)
 
     sqlite_hits = _one_backend("sqlite")
-    # Ensure FAISS index is present before faiss query.
     rebuild_faiss_index()
     faiss_hits = _one_backend("faiss")
     return sqlite_hits, faiss_hits
@@ -152,11 +154,18 @@ def run_graph_smoke() -> dict[str, str]:
     return routes
 
 
+def run_keyword_integrity_smoke() -> dict[str, int]:
+    from scripts.check_classification_keywords import run_keyword_integrity_checks
+
+    return run_keyword_integrity_checks()
+
+
 def main() -> int:
     _bootstrap_path()
     task_id, excel_path, text_path = run_usecase_smoke()
     sqlite_hits, faiss_hits = run_retrieval_smoke()
     graph_routes = run_graph_smoke()
+    keyword_checks = run_keyword_integrity_smoke()
 
     summary = SmokeSummary(
         usecase_task_id=task_id,
@@ -165,6 +174,7 @@ def main() -> int:
         sqlite_hits=sqlite_hits,
         faiss_hits=faiss_hits,
         graph_routes=graph_routes,
+        keyword_checks=keyword_checks,
     )
     print(json.dumps(asdict(summary), ensure_ascii=False, indent=2))
     print("[OK] smoke_minimal passed")

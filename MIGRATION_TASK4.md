@@ -8,6 +8,12 @@ Run once in the project root:
 conda run -n finance-agent python scripts/smoke_minimal.py
 ```
 
+Optional static keyword regression:
+
+```powershell
+conda run -n finance-agent python scripts/check_classification_keywords.py
+```
+
 This script covers three layers:
 
 - usecase smoke:
@@ -21,11 +27,16 @@ This script covers three layers:
   - material route
   - travel route
   - generic route
+- keyword integrity smoke:
+  - verify `app/graph/nodes.py` keeps UTF-8 Chinese route/doc-type keywords
+  - verify `app/services/validator.py` keeps UTF-8 Chinese expense-category rules
 
 ## Modified files and intent
 
 - `scripts/smoke_minimal.py`
-  - Add a single minimal smoke runner for usecase/retrieval/graph.
+  - Add a single minimal smoke runner for usecase/retrieval/graph and include keyword-integrity coverage.
+- `scripts/check_classification_keywords.py`
+  - Add a static regression check that locks route/category keywords to expected UTF-8 Chinese strings.
 - `MIGRATION_TASK4.md`
   - Explain how to run smoke validation and document migration context.
 
@@ -59,8 +70,8 @@ Retrieval layer:
 
 ## Remaining technical debt
 
-- Graph keyword classification in `app/graph/nodes.py` has mojibake text; should be normalized UTF-8 Chinese keywords.
 - No isolated test DB fixture yet; smoke currently writes real task/case data and then partially cleans temporary retrieval documents.
 - Retrieval smoke currently validates hit existence, but not strict ranking consistency between sqlite/faiss.
 - Need CI integration (e.g. GitHub Actions) to run `scripts/smoke_minimal.py` automatically.
+- Need CI integration (e.g. GitHub Actions) to run `scripts/check_classification_keywords.py` as an encoding/regression guard.
 - Usecase API can be further typed (structured return DTOs instead of raw ORM instances).

@@ -8,6 +8,7 @@ from typing import Any
 import streamlit as st
 from pypdf import PdfReader
 
+from app.ui import task_hub, workbench
 from app.usecases import home_guide_agent as guide_usecase
 from app.usecases import travel_agent as travel_usecase
 
@@ -55,15 +56,6 @@ def _extract_pdf_preview_text(file_bytes: bytes, max_chars: int = 1800) -> str:
     if len(value) > max_chars:
         value = value[:max_chars]
     return value
-
-
-def _home_guide_file_signature(files: list[Any]) -> str:
-    parts: list[str] = []
-    for file in files:
-        name = str(getattr(file, "name", ""))
-        size = str(getattr(file, "size", ""))
-        parts.append(f"{name}:{size}")
-    return "|".join(parts)
 
 
 def _home_guide_build_file_infos(files: list[Any]) -> list[dict[str, Any]]:
@@ -185,13 +177,27 @@ def _enter_recommended_flow(*, flow: str, payload: dict[str, Any], files: list[A
     flow_name = str(flow or "")
     if flow_name not in {"travel", "material"}:
         return
-    st.session_state["guide_handoff_payload"] = dict(payload)
-    st.session_state["guide_handoff_uploaded_files"] = list(files)
-    st.session_state["guide_handoff_target_flow"] = flow_name
     st.session_state["guide_handoff_entered_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     st.session_state["active_flow_context"] = _build_active_flow_context(flow_name, payload, files)
     flow_label = "差旅流程" if flow_name == "travel" else "材料费流程"
     jump_reason = "已自动进入" if auto else "已进入"
+    if flow_name == "travel":
+        title = f"差旅任务 {datetime.now().strftime('%m-%d %H:%M')}"
+        task_hub.create_travel_task(
+            title=title,
+            goal=str(payload.get("route_reason") or ""),
+            seed_files=list(files),
+            guide_payload=dict(payload),
+            source="home_guide",
+        )
+        st.session_state.pop("guide_handoff_payload", None)
+        st.session_state.pop("guide_handoff_uploaded_files", None)
+        st.session_state.pop("guide_handoff_target_flow", None)
+    else:
+        st.session_state["guide_handoff_payload"] = dict(payload)
+        st.session_state["guide_handoff_uploaded_files"] = list(files)
+        st.session_state["guide_handoff_target_flow"] = flow_name
+        task_hub.set_selected_material_task("")
     set_current_page(
         _flow_name_to_page(flow_name),
         flash_message=f"{jump_reason}{flow_label}，并带入首页引导的材料与预检查结果。",
@@ -221,20 +227,37 @@ def get_guide_handoff_for_flow(flow: str) -> tuple[dict[str, Any], list[Any]]:
     return (dict(payload) if isinstance(payload, dict) else {}), (list(files) if isinstance(files, list) else [])
 
 
-def render_home_guide_agent(upload_types: list[str]) -> None:
-    st.subheader("报销助手（首页引导 Agent）")
-    st.caption(
-        "你可以先告诉我要报销什么、手头有哪些材料。"
-        "我会先判断流程方向（差旅/材料费），并给你对应材料要求；准备好后再进入正式流程深度处理。"
-    )
+def _extract_home_composer_submission(raw_value: Any) -> tuple[str, list[Any]]:
+    if raw_value is None:
+        return "", []
+    text_value = getattr(raw_value, "text", raw_value)
+    file_value = getattr(raw_value, "files", [])
+    return str(text_value or "").strip(), _as_uploaded_list(file_value)
 
-    auto_route_paused = bool(st.session_state.get("guide_auto_route_paused"))
-    if auto_route_paused:
-        c_resume_1, c_resume_2 = st.columns([5, 1])
-        c_resume_1.info("当前已暂停自动跳转。你可以继续聊天或补材料，准备好后再恢复自动跳转。")
-        if c_resume_2.button("恢复自动跳转", use_container_width=True, key="home_guide_resume_auto"):
-            st.session_state["guide_auto_route_paused"] = False
-            st.rerun()
+
+def _fallback_home_payload(state: dict[str, Any], files: list[Any]) -> dict[str, Any]:
+    payload = dict(state.get("target_flow_payload") or {})
+    if payload:
+        return payload
+    return {
+        "session_id": state.get("session_id"),
+        "recommended_flow": state.get("recommended_flow"),
+        "route_reason": state.get("route_reason"),
+        "user_goal": state.get("user_goal"),
+        "missing_items": list(state.get("missing_items") or []),
+        "identified_doc_types": dict(state.get("identified_doc_types") or {}),
+        "precheck_result": dict(state.get("precheck_result") or {}),
+        "guide_summary": {
+            "uploaded_count": len(list(files or [])),
+            "ready": bool(state.get("is_ready_to_enter_flow")),
+            "updated_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        },
+    }
+
+
+def render_home_guide_agent(upload_types: list[str]) -> None:
+    st.subheader("报销任务立案")
+    st.caption("直接在底部输入框描述任务或拖入材料。我会先做首页预检查，再建议进入差旅或材料工作台。")
 
     state_raw = st.session_state.get("home_guide_state")
     state = guide_usecase.normalize_guide_session(state_raw)
@@ -245,141 +268,118 @@ def render_home_guide_agent(upload_types: list[str]) -> None:
         runtime_files = []
         st.session_state["home_guide_uploaded_files"] = runtime_files
 
-    uploaded = st.file_uploader(
-        "上传材料用于首页预检查（PDF/图片，可多选）",
-        type=upload_types,
-        accept_multiple_files=True,
-        key="home_guide_upload_files",
+    current_files = list(runtime_files)
+    identified = dict(state.get("identified_doc_types") or {})
+    identified_summary = "、".join(
+        f"{doc_type} {count}份"
+        for doc_type, count in sorted(identified.items(), key=lambda item: (-int(item[1] or 0), item[0]))
+        if int(count or 0) > 0
     )
-    current_files = _merge_uploaded_lists(runtime_files, _as_uploaded_list(uploaded))
-    st.session_state["home_guide_uploaded_files"] = current_files
+    recommended_flow = str(state.get("recommended_flow") or "unknown")
+    file_names = [str(getattr(file, "name", "") or "") for file in current_files if getattr(file, "name", None)]
+    payload = _fallback_home_payload(state, current_files)
 
-    current_sig = _home_guide_file_signature(current_files)
-    prev_sig = str(st.session_state.get("home_guide_upload_signature") or "")
-    if current_sig != prev_sig:
-        st.session_state["home_guide_upload_signature"] = current_sig
-        file_infos = _home_guide_build_file_infos(current_files)
-        state, _ = guide_usecase.process_guide_turn(
-            state,
-            user_message="",
-            uploaded_files=file_infos,
-            record_history=False,
+    intake_left, intake_right = st.columns([1.6, 1], gap="large")
+    with intake_left:
+        with st.container(border=True):
+            st.markdown("<div class='wb-card-title'>Agent 对话</div>", unsafe_allow_html=True)
+            st.markdown(
+                "<div class='wb-card-muted'>把问题和材料都交给底部输入框；支持一次附多个 PDF/图片。</div>",
+                unsafe_allow_html=True,
+            )
+            for msg in list(state.get("conversation_history") or [])[-12:]:
+                role = str(msg.get("role") or "assistant")
+                content = str(msg.get("content") or "")
+                if not content:
+                    continue
+                with st.chat_message(role):
+                    st.markdown(content)
+
+    with intake_right:
+        travel_clicked, material_clicked = workbench.render_recommendation_card(
+            recommended_flow_label=_guide_flow_label(recommended_flow),
+            route_reason=str(state.get("route_reason") or ""),
+            file_count=len(current_files),
+            identified_summary=identified_summary or "暂无明显材料类型",
+            can_enter=recommended_flow in {"travel", "material"},
+            file_names=file_names,
+            show_entry_buttons=True,
+            travel_button_label="进入差旅",
+            material_button_label="进入材料",
+            travel_button_key="home_guide_enter_travel",
+            material_button_key="home_guide_enter_material",
         )
-        st.session_state["home_guide_state"] = state
+        with st.expander("查看预检查详情", expanded=False):
+            precheck = dict(state.get("precheck_result") or {})
+            classified_files = list(precheck.get("classified_files") or [])
+            if classified_files:
+                rows = []
+                for item in classified_files:
+                    rows.append(
+                        {
+                            "文件名": item.get("name"),
+                            "类型": item.get("doc_type"),
+                            "依据": item.get("reason"),
+                        }
+                    )
+                st.dataframe(rows, hide_index=True, use_container_width=True)
+            else:
+                st.markdown("<div class='wb-card-muted'>暂无可展示的预检查结果。</div>", unsafe_allow_html=True)
 
-    with st.container(border=True):
-        for msg in list(state.get("conversation_history") or [])[-12:]:
-            role = str(msg.get("role") or "assistant")
-            content = str(msg.get("content") or "")
-            if not content:
-                continue
-            with st.chat_message(role):
-                st.markdown(content)
+            if identified:
+                stats_rows = [{"材料类型": k, "数量": v} for k, v in sorted(identified.items(), key=lambda x: (-x[1], x[0]))]
+                st.dataframe(stats_rows, hide_index=True, use_container_width=True)
 
-    c1, c2 = st.columns([6, 1])
-    c1.caption("直接聊天即可，例如：`我要报销差旅，需要准备什么材料？`")
-    clear_clicked = c2.button("清空引导会话", use_container_width=True, key="home_guide_clear_session")
+        clear_clicked = st.button("重置首页会话", use_container_width=True, key="home_guide_clear_session")
 
     if clear_clicked:
         st.session_state["home_guide_state"] = guide_usecase.new_guide_session()
         st.session_state["home_guide_uploaded_files"] = []
-        st.session_state["home_guide_upload_signature"] = ""
         st.session_state["guide_auto_route_paused"] = False
         st.session_state["guide_last_auto_route_key"] = ""
         st.session_state["active_flow_context"] = {}
         st.session_state.pop("guide_handoff_payload", None)
         st.session_state.pop("guide_handoff_uploaded_files", None)
         st.session_state.pop("guide_handoff_target_flow", None)
-        st.success("已清空首页引导会话。")
+        st.success("已重置首页引导会话。")
         st.rerun()
 
-    user_message = st.chat_input(
-        "告诉我你的报销目标或问题（例如：我要报销差旅，需要准备什么材料）",
+    if travel_clicked:
+        _enter_recommended_flow(flow="travel", payload=payload, files=list(current_files), auto=False)
+        st.rerun()
+    if material_clicked:
+        _enter_recommended_flow(flow="material", payload=payload, files=list(current_files), auto=False)
+        st.rerun()
+
+    composer_value = st.chat_input(
+        "直接描述报销目标，或把文件拖到这里（支持多文件）",
         key="home_guide_chat_input",
+        accept_file="multiple",
+        file_type=upload_types,
+        max_upload_size=200,
     )
-    if user_message is not None:
-        user_message = str(user_message or "").strip()
-        if not user_message and not current_files:
-            st.info("你可以先说一句目标，或者先上传 1-2 份材料。")
-        else:
-            if not user_message:
-                user_message = "我已上传这些材料，请先帮我做首页分流。"
-            file_infos = _home_guide_build_file_infos(current_files)
-            state, _ = guide_usecase.process_guide_turn(
-                st.session_state.get("home_guide_state"),
-                user_message=user_message,
-                uploaded_files=file_infos,
-            )
-            st.session_state["home_guide_state"] = state
-            st.rerun()
+    if composer_value is None:
+        return
 
-    state = guide_usecase.normalize_guide_session(st.session_state.get("home_guide_state"))
+    user_message, attached_files = _extract_home_composer_submission(composer_value)
+    merged_files = _merge_uploaded_lists(current_files, attached_files)
+    st.session_state["home_guide_uploaded_files"] = merged_files
+
+    if not user_message and not merged_files:
+        st.info("你可以直接提问，或者把 1-2 份材料拖进底部输入框。")
+        return
+
+    if not user_message:
+        if attached_files:
+            user_message = f"我上传了 {len(attached_files)} 份材料，请先帮我做首页分流。"
+        else:
+            user_message = "我已上传这些材料，请先帮我做首页分流。"
+
+    file_infos = _home_guide_build_file_infos(merged_files)
+    state, _ = guide_usecase.process_guide_turn(
+        st.session_state.get("home_guide_state"),
+        user_message=user_message,
+        uploaded_files=file_infos,
+    )
     st.session_state["home_guide_state"] = state
-
-    st.markdown("### 引导工作台")
-    g1, g2, g3, g4 = st.columns(4)
-    recommended_flow = str(state.get("recommended_flow") or "unknown")
-    can_enter_now = recommended_flow in {"travel", "material"}
-    g1.metric("推荐流程", _guide_flow_label(recommended_flow))
-    g2.metric("已上传", len(current_files))
-    identified = dict(state.get("identified_doc_types") or {})
-    g3.metric("识别类型数", sum(int(v or 0) for v in identified.values()))
-    g4.metric("进入状态", _guide_status_badge_text(can_enter_now))
-
-    st.caption(f"判断依据：{str(state.get('route_reason') or '待补充信息')}")
-
-    with st.expander("查看已上传材料与预检查结果", expanded=False):
-        precheck = dict(state.get("precheck_result") or {})
-        classified_files = list(precheck.get("classified_files") or [])
-        if classified_files:
-            rows = []
-            for item in classified_files:
-                rows.append(
-                    {
-                        "文件名": item.get("name"),
-                        "类型": item.get("doc_type"),
-                        "依据": item.get("reason"),
-                    }
-                )
-            st.dataframe(rows, hide_index=True, use_container_width=True)
-        else:
-            st.info("暂无可展示的预检查结果。")
-
-        if identified:
-            stats_rows = [{"材料类型": k, "数量": v} for k, v in sorted(identified.items(), key=lambda x: (-x[1], x[0]))]
-            st.dataframe(stats_rows, hide_index=True, use_container_width=True)
-
-    enter_disabled = recommended_flow not in {"travel", "material", "policy"}
-    payload = dict(state.get("target_flow_payload") or {})
-    auto_route_key = "|".join(
-        [
-            str(state.get("session_id") or ""),
-            recommended_flow,
-            current_sig,
-            str(payload.get("guide_summary", {}).get("updated_at") or ""),
-        ]
-    )
-    can_auto_route = (
-        recommended_flow in {"travel", "material"}
-        and bool(payload)
-        and not bool(st.session_state.get("guide_auto_route_paused"))
-    )
-    if can_auto_route and st.session_state.get("guide_last_auto_route_key") != auto_route_key:
-        st.session_state["guide_last_auto_route_key"] = auto_route_key
-        _enter_recommended_flow(flow=recommended_flow, payload=payload, files=list(current_files), auto=True)
-        st.rerun()
-
-    enter_label = "进入推荐流程"
-    enter_clicked = st.button(enter_label, use_container_width=True, disabled=enter_disabled, key="home_guide_enter_flow")
-
-    if enter_clicked:
-        if recommended_flow == "travel":
-            _enter_recommended_flow(flow="travel", payload=payload, files=list(current_files), auto=False)
-            st.rerun()
-        if recommended_flow == "material":
-            _enter_recommended_flow(flow="material", payload=payload, files=list(current_files), auto=False)
-            st.rerun()
-        if recommended_flow == "policy":
-            st.info("当前推荐为制度咨询。你可以继续在首页对话区提问，或手动进入其他流程。")
-
-    st.divider()
+    st.rerun()
