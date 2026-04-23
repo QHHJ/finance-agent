@@ -8,6 +8,7 @@ from typing import Any
 import streamlit as st
 from pypdf import PdfReader
 
+from app.agents import AgentTask, ReimbursementAgentOrchestrator
 from app.ui import task_hub, workbench
 from app.usecases import home_guide_agent as guide_usecase
 from app.usecases import travel_agent as travel_usecase
@@ -16,6 +17,14 @@ PAGE_HOME_GUIDE = "home_guide"
 PAGE_TRAVEL_FLOW = "travel_flow"
 PAGE_MATERIAL_FLOW = "material_flow"
 VALID_ROUTER_PAGES = {PAGE_HOME_GUIDE, PAGE_TRAVEL_FLOW, PAGE_MATERIAL_FLOW}
+_HOME_AGENT_ORCHESTRATOR: ReimbursementAgentOrchestrator | None = None
+
+
+def _get_agent_orchestrator() -> ReimbursementAgentOrchestrator:
+    global _HOME_AGENT_ORCHESTRATOR
+    if _HOME_AGENT_ORCHESTRATOR is None:
+        _HOME_AGENT_ORCHESTRATOR = ReimbursementAgentOrchestrator()
+    return _HOME_AGENT_ORCHESTRATOR
 
 
 def _as_uploaded_list(uploaded_value) -> list[Any]:
@@ -376,10 +385,31 @@ def render_home_guide_agent(upload_types: list[str]) -> None:
             user_message = "我已上传这些材料，请先帮我做首页分流。"
 
     file_infos = _home_guide_build_file_infos(merged_files)
-    state, _ = guide_usecase.process_guide_turn(
-        st.session_state.get("home_guide_state"),
-        user_message=user_message,
-        uploaded_files=file_infos,
+    result = _get_agent_orchestrator().run_task(
+        AgentTask(
+            agent="conversation_agent",
+            objective="run_home_turn",
+            payload={
+                "turn_processor": guide_usecase.process_guide_turn,
+                "state": st.session_state.get("home_guide_state"),
+                "user_message": user_message,
+                "uploaded_files": file_infos,
+            },
+        )
     )
+    if result.ok:
+        state = dict(result.payload.get("state") or {})
+        enter_flow = str(result.payload.get("enter_flow") or "").strip()
+        if enter_flow in {"travel", "material"}:
+            payload = _fallback_home_payload(state, merged_files)
+            _enter_recommended_flow(flow=enter_flow, payload=payload, files=list(merged_files), auto=False)
+            st.session_state["home_guide_state"] = state
+            st.rerun()
+    else:
+        state, _ = guide_usecase.process_guide_turn(
+            st.session_state.get("home_guide_state"),
+            user_message=user_message,
+            uploaded_files=file_infos,
+        )
     st.session_state["home_guide_state"] = state
     st.rerun()

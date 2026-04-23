@@ -41,8 +41,8 @@ class GuideSessionState:
 
 def _welcome_text() -> str:
     return (
-        "你好，我是首页引导助手。你可以先说要报销什么、手头有哪些材料，"
-        "我会先帮你判断走差旅还是材料费，并告诉你对应要准备什么。"
+        "你好，我是报销助手。你可以直接说“差旅报销”或“材料费报销”，"
+        "也可以先上传 1-2 份票据，我会先帮你分流并告诉你下一步。"
     )
 
 
@@ -234,10 +234,31 @@ def _flow_label(flow: str) -> str:
     }.get(str(flow or "unknown"), "未确定")
 
 
+def _is_greeting_message(user_message: str) -> bool:
+    text = _normalize_text(user_message)
+    if not text:
+        return False
+    compact = re.sub(r"[\s,，.。!！?？~～…]", "", text)
+    greeting_tokens = ["你好", "您好", "嗨", "哈喽", "hello", "hi", "hey", "在吗", "有人吗"]
+    return any(compact == token or compact.startswith(token) for token in greeting_tokens)
+
+
+def _is_ack_message(user_message: str) -> bool:
+    text = _normalize_text(user_message)
+    if not text:
+        return False
+    compact = re.sub(r"[\s,，.。!！?？~～…]", "", text)
+    return compact in {"好", "好的", "嗯", "嗯嗯", "收到", "明白", "ok", "okay"}
+
+
 def _focus_type(user_message: str) -> str:
     text = _normalize_text(user_message)
     if not text:
         return "upload_only"
+    if _is_greeting_message(user_message):
+        return "greeting"
+    if _is_ack_message(user_message):
+        return "ack"
     if any(k in text for k in ["需要什么材料", "要什么材料", "准备什么材料", "材料清单", "报销要求", "要准备什么"]):
         return "requirements"
     if any(k in text for k in ["进入流程", "直接进入", "开始处理", "开始报销", "走差旅", "走材料费"]):
@@ -351,27 +372,35 @@ def _compose_reply(state: dict[str, Any], user_message: str) -> str:
         return f"{first}\n\n{second}\n\n{third}"
 
     if flow == "unknown":
-        first = _stable_pick(
-            seed,
-            [
-                "我先看过你当前给的信息了。",
-                "收到，我先做了一轮首页分流判断。",
-                "我先把这批材料做了轻量预判。",
-            ],
-        )
         if uploaded_count <= 0:
-            second = (
-                "目前还没有材料可供预检查，但我可以先把流程和材料要求讲清楚。"
-                "你可以直接说“我要差旅报销”或“我要材料费报销”。"
+            if focus == "greeting":
+                return _stable_pick(
+                    seed,
+                    [
+                        "你好，我在。你这次要报差旅还是材料费？也可以直接上传 1-2 份票据，我来判断。",
+                        "你好，收到。先告诉我是差旅还是材料费；如果你手头有材料，直接上传我来分流。",
+                        "在的。你先说这次是差旅还是材料费，或者先上传 1-2 份材料让我判断。",
+                    ],
+                )
+            if focus == "ack":
+                return "好，我先确认关键点：这次是差旅还是材料费？不确定也没关系，先上传 1-2 份票据我来判断。"
+            first = _stable_pick(
+                seed,
+                [
+                    "收到，我先帮你收敛到下一步。",
+                    "明白，我先按最短路径带你往下走。",
+                    "好，我先给你一个可执行起点。",
+                ],
             )
-            third = "如果你愿意，我现在就可以先给你对应清单；也可以先上传 1-2 份票据让我判断。"
+            second = "你先告诉我是“差旅”还是“材料费”；或者直接上传 1-2 份票据，我会自动分流并告诉你要补什么。"
+            return f"{first}\n\n{second}"
         else:
+            first = f"目前还不能稳定判定是差旅还是材料费（{reason}）。"
             second = (
-                f"目前还不能稳定判定是差旅还是材料费（{reason}）。"
                 f"现在已纳入 {uploaded_count} 份材料，识别线索：{_top_doc_type_hint(stats)}。"
+                "你补一句“这是差旅报销”或“这是材料费报销”，我就直接分流并进入正式流程。"
             )
-            third = "你补一句“这是差旅报销”或“这是材料费报销”，我就能直接给出分流并进入正式流程。"
-        return f"{first}\n\n{second}\n\n{third}"
+            return f"{first}\n\n{second}"
 
     if focus in {"reason", "review"}:
         first = _stable_pick(seed, ["可以，我说下判断依据。", "我来解释这次分流为什么这样判。", "我把当前分流依据展开给你。"])

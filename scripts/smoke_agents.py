@@ -47,6 +47,73 @@ def _build_mock_profile(uploaded_file, index: int) -> dict:
 def main() -> None:
     orchestrator = ReimbursementAgentOrchestrator()
 
+    conversation_result = orchestrator.run_task(
+        AgentTask(
+            agent="conversation_agent",
+            objective="plan_travel_turn",
+            payload={
+                "user_text": "现在还缺什么",
+                "intent_parser": lambda text, context: {
+                    "intent_type": "chat",
+                    "is_actionable": False,
+                    "risk_level": "low",
+                    "needs_confirmation": False,
+                    "reason": "smoke_chat",
+                },
+                "reply_rule": lambda user_text, assignment, status, profiles: "当前还缺返程票据。",
+                "assignment": {},
+                "status": {"missing": ["返程机票发票/票据"]},
+                "profiles": [],
+                "messages": [],
+            },
+        )
+    )
+    print(f"[conversation] ok={conversation_result.ok} summary={conversation_result.summary}")
+    print(f"[conversation] reply={conversation_result.payload.get('reply', '')}")
+
+    material_conversation_result = orchestrator.run_task(
+        AgentTask(
+            agent="conversation_agent",
+            objective="plan_material_turn",
+            payload={
+                "user_text": "最后一行规格和项目名混了",
+                "intent_parser": lambda text, context: {
+                    "intent_type": "ambiguous",
+                    "is_actionable": False,
+                    "risk_level": "low",
+                    "needs_confirmation": False,
+                    "reason": "smoke_ambiguous",
+                },
+                "task": None,
+                "fields": {},
+                "messages": [],
+                "row_count": 5,
+                "quality_hint_count": 1,
+                "pending_count": 0,
+            },
+        )
+    )
+    print(f"[material-conversation] ok={material_conversation_result.ok} summary={material_conversation_result.summary}")
+    print(f"[material-conversation] reply={material_conversation_result.payload.get('reply', '')}")
+
+    home_result = orchestrator.run_task(
+        AgentTask(
+            agent="conversation_agent",
+            objective="run_home_turn",
+            payload={
+                "turn_processor": lambda state, user_message, uploaded_files: (
+                    {"recommended_flow": "travel", "conversation_history": [{"role": "assistant", "content": "建议进入差旅"}]},
+                    "建议进入差旅",
+                ),
+                "state": {},
+                "user_message": "我要报销差旅",
+                "uploaded_files": [],
+            },
+        )
+    )
+    print(f"[home] ok={home_result.ok} summary={home_result.summary}")
+    print(f"[home] reply={home_result.payload.get('reply', '')}")
+
     travel_result = orchestrator.run_task(
         AgentTask(
             agent="travel_specialist_agent",
@@ -63,7 +130,7 @@ def main() -> None:
         )
     )
     print(f"[travel] ok={travel_result.ok} summary={travel_result.summary}")
-    print(f"[travel] missing={travel_result.payload['status']['missing']}")
+    print(f"[travel] missing={travel_result.payload.get('status', {}).get('missing', [])}")
 
     fake_task = SimpleNamespace(
         extracted_data={
@@ -82,7 +149,10 @@ def main() -> None:
         )
     )
     print(f"[material] ok={material_result.ok} summary={material_result.summary}")
-    print(f"[material] fields={material_result.payload['fields']['line_items']}")
+    if material_result.ok:
+        print(f"[material] fields={material_result.payload.get('fields', {}).get('line_items', [])}")
+    else:
+        print("[material] specialist skipped due to unavailable optional dependency chain.")
 
     execution_result = orchestrator.execute_command(
         AgentCommand(

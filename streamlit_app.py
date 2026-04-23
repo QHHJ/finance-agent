@@ -15,6 +15,7 @@ import requests
 import streamlit as st
 from pypdf import PdfReader
 
+from app.agents import AgentCommand, AgentTask, ReimbursementAgentOrchestrator
 from app.ui import home_router, task_hub, workbench
 from app.usecases import dto as usecase_dto
 from app.usecases import material_agent as material_usecase
@@ -78,6 +79,74 @@ CHINESE_NUM_MAP = {
     "九": 9,
     "十": 10,
 }
+_AGENT_ORCHESTRATOR: ReimbursementAgentOrchestrator | None = None
+
+
+def _get_agent_orchestrator() -> ReimbursementAgentOrchestrator:
+    global _AGENT_ORCHESTRATOR
+    if _AGENT_ORCHESTRATOR is None:
+        _AGENT_ORCHESTRATOR = ReimbursementAgentOrchestrator()
+    return _AGENT_ORCHESTRATOR
+
+
+def _run_travel_specialist_task(objective: str, payload: dict[str, Any]) -> tuple[bool, dict[str, Any], str]:
+    result = _get_agent_orchestrator().run_task(
+        AgentTask(
+            agent="travel_specialist_agent",
+            objective=str(objective or "").strip(),
+            payload=dict(payload or {}),
+        )
+    )
+    return bool(result.ok), dict(result.payload or {}), str(result.summary or "")
+
+
+def _run_conversation_agent_task(
+    objective: str,
+    payload: dict[str, Any],
+) -> tuple[bool, dict[str, Any], str, list[AgentCommand]]:
+    result = _get_agent_orchestrator().run_task(
+        AgentTask(
+            agent="conversation_agent",
+            objective=str(objective or "").strip(),
+            payload=dict(payload or {}),
+        )
+    )
+    return bool(result.ok), dict(result.payload or {}), str(result.summary or ""), list(result.commands or [])
+
+
+def _execute_agent_command(command: AgentCommand) -> tuple[bool, dict[str, Any], str]:
+    result = _get_agent_orchestrator().execute_command(command)
+    return bool(result.ok), dict(result.payload or {}), str(result.summary or "")
+
+
+def _build_travel_execution_payload(
+    *,
+    pool_list: list[Any],
+    assignment: dict[str, Any],
+    profiles: list[dict[str, Any]],
+    manual_overrides: dict[str, str],
+    manual_slot_overrides: dict[str, str],
+) -> dict[str, Any]:
+    return {
+        "pool_list": pool_list,
+        "assignment": assignment,
+        "profiles": profiles,
+        "manual_overrides": manual_overrides,
+        "manual_slot_overrides": manual_slot_overrides,
+        "reclassify_fn": _apply_reclassify_from_user_text,
+        "slot_fn": _apply_manual_slot_from_user_text,
+        "relabel_fn": _apply_manual_relabel_from_user_text,
+        "amount_fn": _apply_manual_amount_from_user_text,
+        "build_assignment_fn": _build_assignment_from_profiles,
+        "remember_overrides_fn": _remember_manual_overrides,
+        "sync_slot_overrides_fn": _sync_manual_slot_overrides,
+        "learn_fn": travel_usecase.learn_from_profiles,
+        "organize_fn": _organize_travel_materials,
+    }
+
+
+def _material_mark_export_confirmed(flag_key: str) -> None:
+    st.session_state[str(flag_key or "")] = True
 
 
 def _parse_json_object_loose(text: str) -> dict[str, Any] | None:
@@ -2631,6 +2700,24 @@ def _organize_travel_materials(
     manual_overrides: dict[str, str] | None = None,
     manual_slot_overrides: dict[str, str] | None = None,
 ) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+    ok, payload, summary = _run_travel_specialist_task(
+        "organize_materials",
+        {
+            "pool_files": list(pool_files or []),
+            "build_profile": _build_travel_file_profile,
+            "manual_overrides": dict(manual_overrides or {}),
+            "apply_overrides": _apply_manual_overrides_to_profiles,
+            "manual_slot_overrides": dict(manual_slot_overrides or {}),
+            "apply_slot_overrides": _apply_manual_slot_overrides_to_profiles,
+            "build_assignment": _build_assignment_from_profiles,
+        },
+    )
+    if ok:
+        assignment = dict(payload.get("assignment") or {})
+        profiles = list(payload.get("profiles") or [])
+        return assignment, profiles
+
+    st.session_state["travel_agent_backend_warning"] = summary or "Travel specialist agent unavailable."
     _, profiles = travel_usecase.organize_materials(
         pool_files,
         build_profile=_build_travel_file_profile,
@@ -2672,6 +2759,13 @@ def _doc_type_label(doc_type: str) -> str:
 
 
 def _build_travel_agent_status(assignment: dict[str, Any]) -> dict[str, Any]:
+    ok, payload, summary = _run_travel_specialist_task(
+        "build_status",
+        {"assignment": dict(assignment or {})},
+    )
+    if ok:
+        return dict(payload.get("status") or {})
+    st.session_state["travel_agent_backend_warning"] = summary or "Travel status agent unavailable."
     return travel_usecase.build_travel_agent_status(assignment)
 
 
@@ -2769,44 +2863,71 @@ def _travel_restore_undo_snapshot(snapshot: dict[str, Any]) -> tuple[dict[str, A
     return assignment, profiles, manual_overrides, manual_slot_overrides
 
 
-def _travel_build_pending_action_from_text(user_text: str) -> dict[str, Any] | None:
+def _travel_pending_action_spec_from_text(user_text: str) -> dict[str, Any] | None:
     text = str(user_text or "").strip()
     if not text:
         return None
     if any(token in text for token in ["应用全部修正", "应用全部建议", "覆盖当前分配结果"]):
-        return _append_pending_action(
-            _travel_scope_name(),
-            action_type="travel_apply_all",
-            summary="批量应用当前差旅整理建议",
-            target="当前全部待确认建议",
-            risk_level="high",
-            payload={"command": text},
-        )
+        return {
+            "action_type": "travel_apply_all",
+            "summary": "批量应用当前差旅整理建议",
+            "target": "当前全部待确认建议",
+            "risk_level": "high",
+            "payload": {"command": text},
+        }
     if any(token in text for token in ["重新归并", "重新分配", "重排分组", "同一趟"]):
-        return _append_pending_action(
-            _travel_scope_name(),
-            action_type="travel_reorganize",
-            summary="重新归并差旅材料并刷新槽位分配",
-            target="全部已上传材料",
-            risk_level="medium",
-            payload={"command": text},
-        )
+        return {
+            "action_type": "travel_reorganize",
+            "summary": "重新归并差旅材料并刷新槽位分配",
+            "target": "全部已上传材料",
+            "risk_level": "medium",
+            "payload": {"command": text},
+        }
     if any(token in text for token in ["导出报销表", "导出结果", "导出压缩包"]):
-        return _append_pending_action(
-            _travel_scope_name(),
-            action_type="travel_export",
-            summary="确认导出当前差旅材料压缩包",
-            target="差旅导出",
-            risk_level="high",
-            payload={"command": text},
-        )
+        return {
+            "action_type": "travel_export",
+            "summary": "确认导出当前差旅材料压缩包",
+            "target": "差旅导出",
+            "risk_level": "high",
+            "payload": {"command": text},
+        }
+    return {
+        "action_type": "travel_manual_confirm",
+        "summary": "执行一条需要确认的差旅调整",
+        "target": text[:80],
+        "risk_level": "medium",
+        "payload": {"command": text},
+    }
+
+
+def _travel_build_pending_action_from_text(user_text: str) -> dict[str, Any] | None:
+    spec = _travel_pending_action_spec_from_text(user_text)
+    if not spec:
+        return None
     return _append_pending_action(
         _travel_scope_name(),
-        action_type="travel_manual_confirm",
-        summary="执行一条需要确认的差旅调整",
-        target=text[:80],
-        risk_level="medium",
-        payload={"command": text},
+        action_type=str(spec.get("action_type") or ""),
+        summary=str(spec.get("summary") or ""),
+        target=str(spec.get("target") or ""),
+        risk_level=str(spec.get("risk_level") or "medium"),
+        payload=dict(spec.get("payload") or {}),
+    )
+
+
+def _append_travel_pending_action_from_spec(scope_name: str, spec: dict[str, Any]) -> dict[str, Any] | None:
+    if not isinstance(spec, dict):
+        return None
+    action_type = str(spec.get("action_type") or "").strip()
+    summary = str(spec.get("summary") or "").strip()
+    if not action_type or not summary:
+        return None
+    return _append_pending_action(
+        scope_name,
+        action_type=action_type,
+        summary=summary,
+        target=str(spec.get("target") or ""),
+        risk_level=str(spec.get("risk_level") or "medium"),
+        payload=dict(spec.get("payload") or {}),
     )
 
 
@@ -2818,49 +2939,62 @@ def _travel_execute_pending_action(
     manual_overrides: dict[str, str],
     manual_slot_overrides: dict[str, str],
 ) -> tuple[bool, str, dict[str, Any], list[dict[str, Any]]]:
-    action_type = str(action.get("action_type") or "")
-    if action_type == "travel_reorganize":
-        new_assignment, new_profiles = _organize_travel_materials(
-            pool_list,
-            manual_overrides=manual_overrides,
-            manual_slot_overrides=manual_slot_overrides,
+    ok, payload, summary = _execute_agent_command(
+        AgentCommand(
+            command_type="travel_pending_action",
+            payload={
+                "action": dict(action or {}),
+                **_build_travel_execution_payload(
+                    pool_list=pool_list,
+                    assignment=assignment,
+                    profiles=profiles,
+                    manual_overrides=manual_overrides,
+                    manual_slot_overrides=manual_slot_overrides,
+                ),
+            },
+            summary=str(action.get("summary") or "执行差旅待确认动作"),
+            risk_level=str(action.get("risk_level") or "medium"),
+            requires_confirmation=False,
+            created_by="travel_workbench",
         )
-        return True, "已完成重新归并，并刷新去程/返程/酒店分配。", new_assignment, new_profiles
-    if action_type == "travel_export":
+    )
+    if payload.get("export_confirmed"):
         st.session_state["travel_export_confirmed_from_chat"] = True
-        return True, "已确认导出。请在下方“差旅材料打包导出”点击导出按钮。", assignment, profiles
-    if action_type == "travel_apply_all":
-        # 当前版本批量建议主要是确认执行入口，实际变更由具体动作触发。
-        return True, "已确认批量应用请求。若有待确认分类动作，会逐条执行。", assignment, profiles
-    if action_type == "travel_manual_confirm":
-        command = str((action.get("payload") or {}).get("command") or action.get("target") or "").strip()
-        if not command:
-            return False, "待确认动作缺少可执行内容。", assignment, profiles
+    next_assignment = dict(payload.get("assignment") or assignment)
+    next_profiles = list(payload.get("profiles") or profiles)
+    return ok, summary, next_assignment, next_profiles
 
-        recheck_count, _, recheck_error = _apply_reclassify_from_user_text(
-            command,
-            profiles,
-            manual_overrides=manual_overrides,
-            manual_slot_overrides=manual_slot_overrides,
+
+def _travel_execute_light_edit(
+    user_text: str,
+    pool_list: list[Any],
+    assignment: dict[str, Any],
+    profiles: list[dict[str, Any]],
+    manual_overrides: dict[str, str],
+    manual_slot_overrides: dict[str, str],
+) -> tuple[bool, str, dict[str, Any], list[dict[str, Any]], dict[str, Any]]:
+    ok, payload, summary = _execute_agent_command(
+        AgentCommand(
+            command_type="travel_light_edit",
+            payload={
+                "user_text": str(user_text or "").strip(),
+                **_build_travel_execution_payload(
+                    pool_list=pool_list,
+                    assignment=assignment,
+                    profiles=profiles,
+                    manual_overrides=manual_overrides,
+                    manual_slot_overrides=manual_slot_overrides,
+                ),
+            },
+            summary="执行差旅轻修正",
+            risk_level="low",
+            requires_confirmation=False,
+            created_by="travel_workbench",
         )
-        if recheck_error:
-            return False, recheck_error, assignment, profiles
-        if recheck_count > 0:
-            new_assignment = _build_assignment_from_profiles(profiles)
-            return True, f"已按确认内容重新识别 {recheck_count} 份材料。", new_assignment, profiles
-
-        slot_changed_count, _, target_slot = _apply_manual_slot_from_user_text(command, profiles)
-        changed_count, _, _ = _apply_manual_relabel_from_user_text(command, profiles)
-        if slot_changed_count > 0 or changed_count > 0:
-            _remember_manual_overrides(manual_overrides, profiles)
-            _sync_manual_slot_overrides(manual_slot_overrides, profiles)
-            new_assignment = _build_assignment_from_profiles(profiles)
-            if slot_changed_count > 0 and target_slot:
-                return True, f"已按确认内容调整 {slot_changed_count} 份材料槽位到 {_slot_label(target_slot)}。", new_assignment, profiles
-            return True, f"已按确认内容调整 {changed_count} 份材料分类。", new_assignment, profiles
-        return False, "确认后未命中可执行变更，请补充更具体的目标。", assignment, profiles
-
-    return False, f"暂不支持的动作类型：{action_type}", assignment, profiles
+    )
+    next_assignment = dict(payload.get("assignment") or assignment)
+    next_profiles = list(payload.get("profiles") or profiles)
+    return ok, summary, next_assignment, next_profiles, payload
 
 
 def _merge_uploaded_lists(first: list[Any], second: list[Any]) -> list[Any]:
@@ -3264,6 +3398,18 @@ def _generate_travel_agent_reply_rule(
     status: dict[str, Any],
     profiles: list[dict[str, Any]] | None = None,
 ) -> str:
+    def _slot_names(slot: str) -> list[str]:
+        return [str(getattr(item, "name", "") or "") for item in _as_uploaded_list(assignment.get(slot))]
+
+    def _slot_text(slot: str) -> str:
+        names = [name for name in _slot_names(slot) if name]
+        if not names:
+            return "无"
+        return "、".join(names)
+
+    def _amount_text(key: str) -> str:
+        return _format_amount(_safe_float(assignment.get(key))) or "无"
+
     text = (user_text or "").strip()
     if not text:
         return "请继续描述你的问题，比如“我还缺什么”或“有哪些金额不一致”。"
@@ -3281,6 +3427,35 @@ def _generate_travel_agent_reply_rule(
         if status["issues"]:
             return "当前发现的问题：\n- " + "\n- ".join(status["issues"])
         return "目前未发现金额不一致问题。"
+
+    if any(key in text for key in ["对不上", "对不齐", "对应不上", "哪个和哪个"]) and status["issues"]:
+        lines: list[str] = []
+        if ("返程" in text or "回程" in text or not any(key in text for key in ["去程", "酒店"])) and (
+            _safe_float(assignment.get("return_ticket_amount")) is not None or _safe_float(assignment.get("return_payment_amount")) is not None
+        ):
+            lines.append(
+                "返程这组目前是："
+                f"票据={_slot_text('return_ticket')}，支付={_slot_text('return_payment')}，"
+                f"金额={_amount_text('return_ticket_amount')} vs {_amount_text('return_payment_amount')}。"
+            )
+        if ("酒店" in text or not any(key in text for key in ["去程", "返程", "回程"])) and (
+            _safe_float(assignment.get("hotel_invoice_amount")) is not None or _safe_float(assignment.get("hotel_payment_amount")) is not None
+        ):
+            lines.append(
+                "酒店这组目前是："
+                f"发票={_slot_text('hotel_invoice')}，支付={_slot_text('hotel_payment')}，订单={_slot_text('hotel_order')}，"
+                f"金额={_amount_text('hotel_invoice_amount')} vs {_amount_text('hotel_payment_amount')}。"
+            )
+        if ("去程" in text) and (
+            _safe_float(assignment.get("go_ticket_amount")) is not None or _safe_float(assignment.get("go_payment_amount")) is not None
+        ):
+            lines.append(
+                "去程这组目前是："
+                f"票据={_slot_text('go_ticket')}，支付={_slot_text('go_payment')}，"
+                f"金额={_amount_text('go_ticket_amount')} vs {_amount_text('go_payment_amount')}。"
+            )
+        if lines:
+            return "\n".join(lines)
 
     if any(key in text for key in ["分配", "归类", "对应", "怎么放", "分到", "放到"]):
         lines = []
@@ -3305,6 +3480,33 @@ def _generate_travel_agent_reply_rule(
         if not lines:
             return "当前还没有可分配的材料。"
         return "我目前的分配结果如下：\n" + "\n".join(lines)
+
+    if "酒店" in text and any(key in text for key in ["支付", "发票", "订单", "对应", "哪个文件"]):
+        return (
+            "酒店相关材料目前是：\n"
+            f"- 酒店发票：{_slot_text('hotel_invoice')}\n"
+            f"- 酒店支付记录：{_slot_text('hotel_payment')}\n"
+            f"- 酒店订单截图：{_slot_text('hotel_order')}\n"
+            f"- 金额核对：{_amount_text('hotel_invoice_amount')} vs {_amount_text('hotel_payment_amount')}"
+        )
+
+    if ("返程" in text or "回程" in text) and any(key in text for key in ["支付", "票据", "明细", "对应", "哪个文件"]):
+        return (
+            "返程相关材料目前是：\n"
+            f"- 返程票据：{_slot_text('return_ticket')}\n"
+            f"- 返程支付：{_slot_text('return_payment')}\n"
+            f"- 返程明细：{_slot_text('return_detail')}\n"
+            f"- 金额核对：{_amount_text('return_ticket_amount')} vs {_amount_text('return_payment_amount')}"
+        )
+
+    if "去程" in text and any(key in text for key in ["支付", "票据", "明细", "对应", "哪个文件"]):
+        return (
+            "去程相关材料目前是：\n"
+            f"- 去程票据：{_slot_text('go_ticket')}\n"
+            f"- 去程支付：{_slot_text('go_payment')}\n"
+            f"- 去程明细：{_slot_text('go_detail')}\n"
+            f"- 金额核对：{_amount_text('go_ticket_amount')} vs {_amount_text('go_payment_amount')}"
+        )
 
     if any(key in text for key in ["为什么", "原因"]) and profiles:
         matched = []
@@ -3752,6 +3954,9 @@ def _render_travel_workbench() -> dict[str, Any]:
     profile_rows = _build_travel_profile_rows(profiles)
 
     with center_col:
+        backend_warning = str(st.session_state.pop("travel_agent_backend_warning", "") or "").strip()
+        if backend_warning:
+            st.warning(f"差旅 Agent 后台暂不可用，已回退旧链路：{backend_warning}")
         if guide_payload:
             with st.expander("查看首页立案摘要", expanded=False):
                 st.json(guide_payload)
@@ -3764,22 +3969,74 @@ def _render_travel_workbench() -> dict[str, Any]:
         user_input = st.chat_input("例如：我现在还缺什么？", key=f"travel_agent_chat_input_{active_task_id}")
         if user_input:
             messages.append({"role": "user", "content": user_input})
-            intent = classify_user_message_intent(
-                user_input,
+            plan_ok, plan_payload, plan_summary, plan_commands = _run_conversation_agent_task(
+                "plan_travel_turn",
                 {
-                    "domain": "travel",
-                    "missing_count": len(status.get("missing") or []),
-                    "issue_count": len(status.get("issues") or []),
-                    "pending_count": len(pending_actions),
+                    "user_text": user_input,
+                    "intent_parser": classify_user_message_intent,
+                    "intent_context": {
+                        "domain": "travel",
+                        "missing_count": len(status.get("missing") or []),
+                        "issue_count": len(status.get("issues") or []),
+                        "pending_count": len(pending_actions),
+                    },
+                    "pending_action_builder": _travel_pending_action_spec_from_text,
+                    "reply_llm": _generate_travel_agent_reply_llm,
+                    "reply_rule": _generate_travel_agent_reply_rule,
+                    "assignment": assignment,
+                    "status": status,
+                    "profiles": profiles,
+                    "messages": messages,
+                    "summary_text": summary_text,
+                    "execution_payload": _build_travel_execution_payload(
+                        pool_list=pool_list,
+                        assignment=assignment,
+                        profiles=profiles,
+                        manual_overrides=manual_overrides,
+                        manual_slot_overrides=manual_slot_overrides,
+                    ),
                 },
             )
-            if intent.intent_type == "strong_action" and intent.needs_confirmation:
-                action = _travel_build_pending_action_from_text(user_input)
+            planned_intent = dict(plan_payload.get("intent") or {})
+            intent_type = str(planned_intent.get("intent_type") or "chat")
+            needs_confirmation = bool(planned_intent.get("needs_confirmation"))
+
+            if not plan_ok:
+                messages.append(
+                    {
+                        "role": "assistant",
+                        "content": _compose_three_stage_reply(
+                            "我看到了你的输入。",
+                            plan_summary or "这轮对话规划没有成功，先回退到普通回复。",
+                            "你可以重试一次，或者直接告诉我具体文件名和目标类型。",
+                        ),
+                    }
+                )
+                _save_travel_workspace_snapshot(
+                    active_task_id,
+                    workspace=workspace,
+                    pool_list=pool_list,
+                    messages=messages,
+                    assignment=assignment,
+                    profiles=profiles,
+                    manual_overrides=manual_overrides,
+                    manual_slot_overrides=manual_slot_overrides,
+                    current_signature=current_signature,
+                    guide_payload=guide_payload,
+                )
+                st.rerun()
+
+            if intent_type == "strong_action" and needs_confirmation:
+                action = _append_travel_pending_action_from_spec(
+                    scope_name,
+                    dict(plan_payload.get("pending_action_spec") or {}),
+                )
                 if action:
                     messages.append(
                         {
                             "role": "assistant",
-                            "content": _compose_three_stage_reply(
+                            "content": str(plan_payload.get("reply") or "").strip()
+                            or _compose_three_stage_reply(
                                 "我理解你的意图，这是一个会影响整体结果的操作。",
                                 f"我已把它放进右侧“待确认”：{action.get('summary') or '待确认动作'}。",
                                 "你可以在右侧逐条确认，或者让我继续解释这条建议的影响。",
@@ -3800,7 +4057,7 @@ def _render_travel_workbench() -> dict[str, Any]:
                     )
                     st.rerun()
 
-            if intent.intent_type == "light_edit":
+            if intent_type == "light_edit":
                 _travel_push_undo_snapshot(
                     assignment,
                     profiles,
@@ -3808,102 +4065,30 @@ def _render_travel_workbench() -> dict[str, Any]:
                     manual_slot_overrides,
                     task_id=active_task_id,
                 )
-                with st.spinner("正在应用轻量修正..."):
-                    recheck_count, _, recheck_error = _apply_reclassify_from_user_text(
-                        user_input,
-                        profiles,
-                        manual_overrides=manual_overrides,
-                        manual_slot_overrides=manual_slot_overrides,
-                    )
-                if recheck_error:
-                    messages.append(
-                        {
-                            "role": "assistant",
-                            "content": _compose_three_stage_reply(
-                                "我看到了你的修正意图。",
-                                f"这次还没执行成功：{recheck_error}",
-                                "你可以换一个更完整的文件名，或让我先展示当前分配给你确认。",
-                            ),
-                        }
-                    )
-                    _save_travel_workspace_snapshot(
-                        active_task_id,
-                        workspace=workspace,
-                        pool_list=pool_list,
-                        messages=messages,
-                        assignment=assignment,
-                        profiles=profiles,
-                        manual_overrides=manual_overrides,
-                        manual_slot_overrides=manual_slot_overrides,
-                        current_signature=current_signature,
-                        guide_payload=guide_payload,
-                    )
-                    st.rerun()
-
-                slot_changed_count, slot_changed_names, target_slot = _apply_manual_slot_from_user_text(user_input, profiles)
-                changed_count, changed_names, target_doc_type = _apply_manual_relabel_from_user_text(user_input, profiles)
-                amount_changed_count, amount_changed_names, manual_amount, amount_error = _apply_manual_amount_from_user_text(
-                    user_input, profiles
+                command = plan_commands[0] if plan_commands else AgentCommand(
+                    command_type="travel_light_edit",
+                    payload={
+                        "user_text": user_input,
+                        **_build_travel_execution_payload(
+                            pool_list=pool_list,
+                            assignment=assignment,
+                            profiles=profiles,
+                            manual_overrides=manual_overrides,
+                            manual_slot_overrides=manual_slot_overrides,
+                        ),
+                    },
+                    summary="执行差旅轻修正",
+                    risk_level="low",
+                    requires_confirmation=False,
+                    created_by="travel_workbench_fallback",
                 )
-                if amount_error:
-                    messages.append(
-                        {
-                            "role": "assistant",
-                            "content": _compose_three_stage_reply(
-                                "我看到了你在改金额。",
-                                amount_error,
-                                "你可以直接写“文件名 金额是 746”，我会立刻写回并重新核对金额差异。",
-                            ),
-                        }
-                    )
-                    _save_travel_workspace_snapshot(
-                        active_task_id,
-                        workspace=workspace,
-                        pool_list=pool_list,
-                        messages=messages,
-                        assignment=assignment,
-                        profiles=profiles,
-                        manual_overrides=manual_overrides,
-                        manual_slot_overrides=manual_slot_overrides,
-                        current_signature=current_signature,
-                        guide_payload=guide_payload,
-                    )
-                    st.rerun()
-
-                total_changed = int(recheck_count) + int(slot_changed_count) + int(changed_count) + int(amount_changed_count)
-                if total_changed > 0:
-                    _remember_manual_overrides(manual_overrides, profiles)
-                    _sync_manual_slot_overrides(manual_slot_overrides, profiles)
-                    assignment = _build_assignment_from_profiles(profiles)
-                    try:
-                        travel_usecase.learn_from_profiles(profiles, assignment, reason="manual_chat")
-                    except Exception:
-                        pass
-                    slot_preview = "、".join(slot_changed_names[:3]) if slot_changed_names else ""
-                    if slot_changed_count > 3:
-                        slot_preview += f" 等{slot_changed_count}个文件"
-                    changed_preview = "、".join(changed_names[:3]) if changed_names else ""
-                    if changed_count > 3:
-                        changed_preview += f" 等{changed_count}个文件"
-                    change_text = f"我已完成 {total_changed} 项轻量修正。"
-                    if slot_changed_count > 0 and target_slot:
-                        change_text += f" 已把 {slot_changed_count} 份材料调整到{_slot_label(target_slot)}"
-                        if slot_preview:
-                            change_text += f"（{slot_preview}）"
-                        change_text += "。"
-                    if changed_preview:
-                        change_text += f" 主要调整：{changed_preview}。"
-                    if target_doc_type:
-                        change_text += f" 目标类型：{_doc_type_label(str(target_doc_type))}。"
-                    if amount_changed_count > 0:
-                        amount_preview = "、".join(amount_changed_names[:3]) if amount_changed_names else ""
-                        if amount_changed_count > 3:
-                            amount_preview += f" 等{amount_changed_count}个文件"
-                        change_text += (
-                            f" 已把 {amount_changed_count} 份材料金额修正为 {_format_amount(manual_amount)}"
-                            + (f"（{amount_preview}）" if amount_preview else "")
-                            + "。"
-                        )
+                with st.spinner("正在应用轻量修正..."):
+                    edit_ok, edit_payload, edit_summary = _execute_agent_command(command)
+                    assignment = dict(edit_payload.get("assignment") or assignment)
+                    profiles = list(edit_payload.get("profiles") or profiles)
+                result_type = str(edit_payload.get("result_type") or "")
+                total_changed = int(edit_payload.get("total_changed") or 0)
+                if edit_ok and total_changed > 0:
                     _record_last_applied_action(
                         scope_name,
                         {
@@ -3912,76 +4097,56 @@ def _render_travel_workbench() -> dict[str, Any]:
                             "summary": f"轻修正 {total_changed} 项",
                         },
                     )
-                    messages.append(
-                        {
-                            "role": "assistant",
-                            "content": _compose_three_stage_reply(
-                                "明白，这类修正我可以直接处理。",
-                                change_text,
-                                "如需恢复，我可以撤销刚才的修改；也可以继续帮你检查缺件和金额核对。",
-                            ),
-                        }
+                reply_ok, reply_payload, _, _ = _run_conversation_agent_task(
+                    "compose_travel_edit_reply",
+                    {
+                        "execution_ok": edit_ok,
+                        "execution_summary": edit_summary,
+                        "result_type": result_type,
+                        "total_changed": total_changed,
+                        "slot_changed_count": int(edit_payload.get("slot_changed_count") or 0),
+                        "slot_changed_names": list(edit_payload.get("slot_changed_names") or []),
+                        "target_slot_label": _slot_label(str(edit_payload.get("target_slot") or ""))
+                        if str(edit_payload.get("target_slot") or "")
+                        else "",
+                        "changed_count": int(edit_payload.get("changed_count") or 0),
+                        "changed_names": list(edit_payload.get("changed_names") or []),
+                        "target_doc_type_label": _doc_type_label(str(edit_payload.get("target_doc_type") or ""))
+                        if edit_payload.get("target_doc_type")
+                        else "",
+                        "amount_changed_count": int(edit_payload.get("amount_changed_count") or 0),
+                        "amount_changed_names": list(edit_payload.get("amount_changed_names") or []),
+                        "manual_amount_text": _format_amount(_safe_float(edit_payload.get("manual_amount"))),
+                    },
+                )
+                reply_text = str(reply_payload.get("reply") or "").strip()
+                if not reply_ok or not reply_text:
+                    reply_text = _compose_three_stage_reply(
+                        "我理解你的修改意图了。",
+                        edit_summary or "这次没有命中可执行变更。",
+                        "你可以继续说“改到返程机票明细/去程支付记录”，或者再点一次文件让我直接改。",
                     )
-                    _save_travel_workspace_snapshot(
-                        active_task_id,
-                        workspace=workspace,
-                        pool_list=pool_list,
-                        messages=messages,
-                        assignment=assignment,
-                        profiles=profiles,
-                        manual_overrides=manual_overrides,
-                        manual_slot_overrides=manual_slot_overrides,
-                        current_signature=current_signature,
-                        guide_payload=guide_payload,
-                    )
-                    st.rerun()
+                messages.append({"role": "assistant", "content": reply_text})
+                _save_travel_workspace_snapshot(
+                    active_task_id,
+                    workspace=workspace,
+                    pool_list=pool_list,
+                    messages=messages,
+                    assignment=assignment,
+                    profiles=profiles,
+                    manual_overrides=manual_overrides,
+                    manual_slot_overrides=manual_slot_overrides,
+                    current_signature=current_signature,
+                    guide_payload=guide_payload,
+                )
+                st.rerun()
 
-                matched_profiles = _match_profiles_by_user_text(user_input, profiles)
-                if matched_profiles:
-                    profile = matched_profiles[0]
-                    desired_slot = _target_slot_from_user_text(
-                        user_input,
-                        str(profile.get("name") or ""),
-                        str(profile.get("doc_type") or ""),
-                    )
-                    desired_doc_type = _target_doc_type_from_user_text(user_input, str(profile.get("name") or ""))
-                    current_slot_label = _slot_label(str(profile.get("manual_slot") or profile.get("slot") or "unknown"))
-                    current_doc_label = _doc_type_label(str(profile.get("doc_type") or "unknown"))
-                    if desired_slot or desired_doc_type:
-                        already_text = f"{str(profile.get('name') or '')} 当前已经是 {current_doc_label} / {current_slot_label}。"
-                        if desired_slot and str(profile.get("manual_slot") or profile.get("slot") or "") != desired_slot:
-                            already_text = (
-                                f"我识别到了你的槽位修改意图，但这次没有写入成功。当前仍是 {current_doc_label} / {current_slot_label}。"
-                            )
-                        messages.append(
-                            {
-                                "role": "assistant",
-                                "content": _compose_three_stage_reply(
-                                    "我理解你的修改意图了。",
-                                    already_text,
-                                    "你可以继续说“改到返程机票明细/去程支付记录”，或者再点一次文件让我直接改。",
-                                ),
-                            }
-                        )
-                        _save_travel_workspace_snapshot(
-                            active_task_id,
-                            workspace=workspace,
-                            pool_list=pool_list,
-                            messages=messages,
-                            assignment=assignment,
-                            profiles=profiles,
-                            manual_overrides=manual_overrides,
-                            manual_slot_overrides=manual_slot_overrides,
-                            current_signature=current_signature,
-                            guide_payload=guide_payload,
-                        )
-                        st.rerun()
-
-            if intent.intent_type == "ambiguous":
+            if intent_type == "ambiguous":
                 messages.append(
                     {
                         "role": "assistant",
-                        "content": _compose_three_stage_reply(
+                        "content": str(plan_payload.get("reply") or "").strip()
+                        or _compose_three_stage_reply(
                             "我理解你觉得结果有点不对。",
                             summary_text,
                             "你可以告诉我具体文件名和目标类型，我会先给出调整再请你确认。",
@@ -4002,10 +4167,10 @@ def _render_travel_workbench() -> dict[str, Any]:
                 )
                 st.rerun()
 
-            reply = _generate_travel_agent_reply_llm(user_input, assignment, status, profiles, messages)
+            reply = str(plan_payload.get("reply") or "").strip()
             if not reply:
                 reply = _generate_travel_agent_reply_rule(user_input, assignment, status, profiles)
-            messages.append({"role": "assistant", "content": str(reply or "").strip()})
+            messages.append({"role": "assistant", "content": reply})
             _save_travel_workspace_snapshot(
                 active_task_id,
                 workspace=workspace,
@@ -4169,6 +4334,29 @@ def _render_travel_workbench() -> dict[str, Any]:
                                     guide_payload=guide_payload,
                                 )
                                 st.rerun()
+                            messages.append(
+                                {
+                                    "role": "assistant",
+                                    "content": _compose_three_stage_reply(
+                                        "我收到了你的确认请求。",
+                                        msg,
+                                        "你可以补充更具体的文件名和目标，或先让我解释这条动作为什么没执行。",
+                                    ),
+                                }
+                            )
+                            _save_travel_workspace_snapshot(
+                                active_task_id,
+                                workspace=workspace,
+                                pool_list=pool_list,
+                                messages=messages,
+                                assignment=assignment,
+                                profiles=profiles,
+                                manual_overrides=manual_overrides,
+                                manual_slot_overrides=manual_slot_overrides,
+                                current_signature=current_signature,
+                                guide_payload=guide_payload,
+                            )
+                            st.rerun()
             else:
                 st.info("当前没有待确认动作。高风险指令会先放在这里，确认后再执行。")
             if apply_all and pending_actions:
@@ -4180,6 +4368,7 @@ def _render_travel_workbench() -> dict[str, Any]:
                     task_id=active_task_id,
                 )
                 success_count = 0
+                failed_count = 0
                 for action in list(pending_actions):
                     ok, msg, assignment, profiles = _travel_execute_pending_action(
                         action,
@@ -4193,12 +4382,14 @@ def _render_travel_workbench() -> dict[str, Any]:
                         success_count += 1
                         _record_last_applied_action(scope_name, action)
                         _remove_pending_action(scope_name, str(action.get("action_id") or ""))
+                    else:
+                        failed_count += 1
                 messages.append(
                     {
                         "role": "assistant",
                         "content": _compose_three_stage_reply(
                             "好的，我已经处理你的批量确认。",
-                            f"已批量执行 {success_count} 条待确认动作。",
+                            f"已批量执行 {success_count} 条待确认动作，未执行 {failed_count} 条。",
                             "你可以继续微调分类，或直接导出当前结果。",
                         ),
                     }
@@ -5095,48 +5286,75 @@ def _material_scope_name(task_id: str) -> str:
     return f"material_agent_{task_id}"
 
 
-def _material_build_pending_action_from_text(user_text: str, task, fields: dict[str, Any]) -> dict[str, Any] | None:
+def _material_pending_action_spec_from_text(user_text: str, task, fields: dict[str, Any]) -> dict[str, Any] | None:
     text = str(user_text or "").strip()
     if not text:
         return None
 
     if any(token in text for token in ["导出报销表", "导出结果", "导出excel", "导出 excel"]):
-        return _append_pending_action(
-            _material_scope_name(task.id),
-            action_type="material_export",
-            summary="确认导出当前材料费结果",
-            target="当前任务导出",
-            risk_level="high",
-            payload={"command": text},
-        )
+        return {
+            "action_type": "material_export",
+            "summary": "确认导出当前材料费结果",
+            "target": "当前任务导出",
+            "risk_level": "high",
+            "payload": {"command": text},
+        }
 
     if any(token in text for token in ["应用全部修正", "应用全部建议", "覆盖当前结果", "覆盖当前分配结果"]):
-        return _append_pending_action(
-            _material_scope_name(task.id),
-            action_type="material_apply_all",
-            summary="批量应用当前材料费待确认建议",
-            target="当前任务全部待确认动作",
-            risk_level="high",
-            payload={"command": text},
-        )
+        return {
+            "action_type": "material_apply_all",
+            "summary": "批量应用当前材料费待确认建议",
+            "target": "当前任务全部待确认动作",
+            "risk_level": "high",
+            "payload": {"command": text},
+        }
 
     if any(token in text for token in ["智能修复", "重新识别", "应用llm修复表", "应用llm结果", "应用对比结果"]):
-        return _append_pending_action(
-            _material_scope_name(task.id),
-            action_type="material_command",
-            summary="执行一条高影响材料费调整",
-            target=text[:120],
-            risk_level="high",
-            payload={"command": text},
-        )
+        return {
+            "action_type": "material_command",
+            "summary": "执行一条高影响材料费调整",
+            "target": text[:120],
+            "risk_level": "high",
+            "payload": {"command": text},
+        }
 
+    return {
+        "action_type": "material_command",
+        "summary": "执行一条待确认材料费调整",
+        "target": text[:120],
+        "risk_level": "medium",
+        "payload": {"command": text},
+    }
+
+
+def _material_build_pending_action_from_text(user_text: str, task, fields: dict[str, Any]) -> dict[str, Any] | None:
+    spec = _material_pending_action_spec_from_text(user_text, task, fields)
+    if not spec:
+        return None
     return _append_pending_action(
         _material_scope_name(task.id),
-        action_type="material_command",
-        summary="执行一条待确认材料费调整",
-        target=text[:120],
-        risk_level="medium",
-        payload={"command": text},
+        action_type=str(spec.get("action_type") or ""),
+        summary=str(spec.get("summary") or ""),
+        target=str(spec.get("target") or ""),
+        risk_level=str(spec.get("risk_level") or "medium"),
+        payload=dict(spec.get("payload") or {}),
+    )
+
+
+def _append_material_pending_action_from_spec(scope: str, spec: dict[str, Any]) -> dict[str, Any] | None:
+    if not isinstance(spec, dict):
+        return None
+    action_type = str(spec.get("action_type") or "").strip()
+    summary = str(spec.get("summary") or "").strip()
+    if not action_type or not summary:
+        return None
+    return _append_pending_action(
+        scope,
+        action_type=action_type,
+        summary=summary,
+        target=str(spec.get("target") or ""),
+        risk_level=str(spec.get("risk_level") or "medium"),
+        payload=dict(spec.get("payload") or {}),
     )
 
 
@@ -5156,6 +5374,60 @@ def _material_execute_pending_action(action: dict[str, Any], task, fields: dict[
     if not handled:
         return False, "确认后未命中可执行动作，请补充更具体的目标。", task, fields
     return True, reply, updated_task, updated_fields
+
+
+def _build_material_execution_payload(task, fields: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "task": task,
+        "fields": fields,
+        "handler": _material_agent_apply_chat_command,
+    }
+
+
+def _execute_material_light_edit_command(
+    *,
+    user_text: str,
+    task,
+    fields: dict[str, Any],
+) -> tuple[bool, dict[str, Any], str]:
+    return _execute_agent_command(
+        AgentCommand(
+            command_type="material_light_edit",
+            payload={
+                "user_text": str(user_text or "").strip(),
+                **_build_material_execution_payload(task, fields),
+            },
+            summary="执行材料费轻修正",
+            risk_level="low",
+            requires_confirmation=False,
+            created_by="material_workbench",
+        )
+    )
+
+
+def _execute_material_pending_action_command(
+    *,
+    action: dict[str, Any],
+    task,
+    fields: dict[str, Any],
+) -> tuple[bool, dict[str, Any], str]:
+    return _execute_agent_command(
+        AgentCommand(
+            command_type="material_pending_action",
+            payload={
+                "action": dict(action or {}),
+                "task": task,
+                "fields": fields,
+                "handler": _material_execute_pending_action,
+                "set_export_confirmed": _material_mark_export_confirmed,
+                "export_flag_key": f"material_export_confirmed_{task.id}",
+            },
+            summary=str(action.get("summary") or "执行材料费待确认动作"),
+            risk_level=str(action.get("risk_level") or "medium"),
+            requires_confirmation=False,
+            created_by="material_workbench",
+        )
+    )
 
 
 def _material_agent_build_row_diff(old_rows: list[dict[str, Any]], new_rows: list[dict[str, Any]], max_lines: int = 8) -> list[str]:
@@ -5850,14 +6122,18 @@ def _render_material_pending_queue(
                     _remove_pending_action(scope, action_id)
                     st.rerun()
                 if confirm_clicked:
-                    ok, msg, updated_task, updated_fields = _material_execute_pending_action(action, task, fields)
+                    ok, result_payload, msg = _execute_material_pending_action_command(
+                        action=action,
+                        task=task,
+                        fields=fields,
+                    )
                     if not ok:
                         st.warning(msg)
                     else:
                         _record_last_applied_action(scope, action)
                         _remove_pending_action(scope, action_id)
-                        task = updated_task or task
-                        fields = updated_fields or fields
+                        task = result_payload.get("task") or task
+                        fields = result_payload.get("fields") or fields
                         task_messages.append(
                             {
                                 "role": "assistant",
@@ -5876,13 +6152,17 @@ def _render_material_pending_queue(
         success_count = 0
         failed_lines: list[str] = []
         for action in list(pending_actions):
-            ok, msg, updated_task, updated_fields = _material_execute_pending_action(action, task, fields)
+            ok, result_payload, msg = _execute_material_pending_action_command(
+                action=action,
+                task=task,
+                fields=fields,
+            )
             if ok:
                 success_count += 1
                 _record_last_applied_action(scope, action)
                 _remove_pending_action(scope, str(action.get("action_id") or ""))
-                task = updated_task or task
-                fields = updated_fields or fields
+                task = result_payload.get("task") or task
+                fields = result_payload.get("fields") or fields
             else:
                 failed_lines.append(msg)
         summary = f"已批量应用 {success_count} 条建议。"
@@ -5925,23 +6205,56 @@ def _render_material_chat_thread(
         return
 
     task_messages.append({"role": "user", "content": user_input})
-    intent = classify_user_message_intent(
-        user_input,
+    plan_ok, plan_payload, plan_summary, plan_commands = _run_conversation_agent_task(
+        "plan_material_turn",
         {
-            "domain": "material",
-            "line_count": len(rows),
-            "pending_count": len(pending_actions),
+            "user_text": user_input,
+            "intent_parser": classify_user_message_intent,
+            "intent_context": {
+                "domain": "material",
+                "line_count": len(rows),
+                "pending_count": len(pending_actions),
+                "quality_hint_count": len(quality_hints),
+            },
+            "pending_action_builder": _material_pending_action_spec_from_text,
+            "reply_llm": _generate_material_agent_reply_llm,
+            "task": task,
+            "fields": fields,
+            "messages": task_messages,
+            "row_count": len(rows),
             "quality_hint_count": len(quality_hints),
+            "pending_count": len(pending_actions),
+            "execution_payload": _build_material_execution_payload(task, fields),
         },
     )
+    planned_intent = dict(plan_payload.get("intent") or {})
+    intent_type = str(planned_intent.get("intent_type") or "chat")
+    needs_confirmation = bool(planned_intent.get("needs_confirmation"))
 
-    if intent.intent_type == "strong_action" and intent.needs_confirmation:
-        action = _material_build_pending_action_from_text(user_input, task, fields)
+    if not plan_ok:
+        task_messages.append(
+            {
+                "role": "assistant",
+                "content": _compose_three_stage_reply(
+                    "我看到了你的输入。",
+                    plan_summary or "这轮对话规划没有成功，先按普通说明处理。",
+                    "你可以重试一次，或者直接告诉我哪一行、哪个字段、希望改成什么。",
+                ),
+            }
+        )
+        st.rerun()
+
+    if intent_type == "strong_action" and needs_confirmation:
+        action = _append_material_pending_action_from_spec(
+            scope,
+            dict(plan_payload.get("pending_action_spec") or {}),
+        )
         if action:
             task_messages.append(
                 {
                     "role": "assistant",
-                    "content": _compose_three_stage_reply(
+                    "content": str(plan_payload.get("reply") or "").strip()
+                    or _compose_three_stage_reply(
                         "我理解你的操作意图，这一步影响范围较大。",
                         f"我已把它放入右侧待确认区：{action.get('summary') or '待确认动作'}。",
                         "你可以在右侧逐条确认，或点“应用全部建议”。",
@@ -5950,55 +6263,56 @@ def _render_material_chat_thread(
             )
             st.rerun()
 
-    if intent.intent_type == "light_edit":
-        handled, reply, updated_task, updated_fields = _material_agent_apply_chat_command(user_input, task, fields)
-        if handled:
+    if intent_type == "light_edit":
+        command = plan_commands[0] if plan_commands else AgentCommand(
+            command_type="material_light_edit",
+            payload={
+                "user_text": user_input,
+                **_build_material_execution_payload(task, fields),
+            },
+            summary="执行材料费轻修正",
+            risk_level="low",
+            requires_confirmation=False,
+            created_by="material_workbench_fallback",
+        )
+        edit_ok, edit_payload, edit_summary = _execute_agent_command(command)
+        if edit_ok and bool(edit_payload.get("handled")):
             _record_last_applied_action(
                 scope,
                 {
                     "action_id": uuid4().hex,
                     "action_type": "material_light_edit",
-                    "summary": str(reply or "轻量修正"),
+                    "summary": str(edit_summary or "轻量修正"),
                 },
             )
-            task_messages.append(
-                {
-                    "role": "assistant",
-                    "content": _compose_three_stage_reply(
-                        "好的，我已经理解并执行了这条轻量修正。",
-                        str(reply or "已更新当前表格。"),
-                        "如需恢复，我可以撤销刚才的修改；也可以继续帮你检查剩余风险。",
-                    ),
-                }
-            )
-            if updated_task is not None:
-                task = updated_task
-            if updated_fields is not None:
-                fields = updated_fields
-            st.rerun()
-
-    if intent.intent_type == "ambiguous":
+        reply_ok, reply_payload, _, _ = _run_conversation_agent_task(
+            "compose_material_edit_reply",
+            {
+                "execution_ok": edit_ok and bool(edit_payload.get("handled")),
+                "execution_summary": edit_summary,
+            },
+        )
         task_messages.append(
             {
                 "role": "assistant",
-                "content": _compose_three_stage_reply(
-                    "我理解你在表达“结果可能不太对”。",
-                    f"目前明细 {len(rows)} 行，质量提示 {len(quality_hints)} 条，待确认动作 {len(pending_actions)} 条。",
-                    "你可以告诉我具体行号和字段，或者让我先解释风险最高的几行。",
+                "content": str(reply_payload.get("reply") or "").strip()
+                if reply_ok
+                else _compose_three_stage_reply(
+                    "好的，我已经理解并执行了这条轻量修正。",
+                    str(edit_summary or "已更新当前表格。"),
+                    "如需恢复，我可以撤销刚才的修改；也可以继续帮你检查剩余风险。",
                 ),
             }
         )
         st.rerun()
 
-    llm_reply = _generate_material_agent_reply_llm(user_input, task, fields, task_messages)
-    if not llm_reply:
-        llm_reply = "我先解释当前判断，不会直接改数据。你可以继续追问原因，或告诉我希望改成什么。"
     task_messages.append(
         {
             "role": "assistant",
-            "content": _compose_three_stage_reply(
+            "content": str(plan_payload.get("reply") or "").strip()
+            or _compose_three_stage_reply(
                 "收到，我先按对话方式给你解释。",
-                llm_reply,
+                "我先解释当前判断，不会直接改数据。你可以继续追问原因，或告诉我希望改成什么。",
                 "如果你希望我执行修改，我会先判断风险：低风险可直接改，高风险先进入待确认区。",
             ),
         }

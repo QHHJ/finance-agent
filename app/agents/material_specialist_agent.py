@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from app.usecases import material_agent as material_usecase
+from importlib import import_module
 
 from .base import BaseAgent
 from .contracts import AgentTask
@@ -9,9 +9,23 @@ from .contracts import AgentTask
 class MaterialSpecialistAgent(BaseAgent):
     name = "material_specialist_agent"
 
+    @staticmethod
+    def _load_material_usecase():
+        return import_module("app.usecases.material_agent")
+
     def run(self, task: AgentTask):
         objective = str(task.objective or "").strip()
         payload = dict(task.payload or {})
+        try:
+            material_usecase = self._load_material_usecase()
+        except ModuleNotFoundError as exc:
+            dependency = getattr(exc, "name", None) or "unknown"
+            summary = f"Material specialist unavailable: missing dependency {dependency}."
+            return self._result(
+                ok=False,
+                summary=summary,
+                events=[self._event("dependency_missing", summary, {"dependency": dependency})],
+            )
 
         if objective == "extract_fields":
             extracted = material_usecase.extract_fields(payload.get("task"))
