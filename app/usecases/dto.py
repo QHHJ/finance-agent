@@ -20,6 +20,7 @@ class MaterialBatchProcessResult:
 class TravelStatus:
     missing: list[str] = field(default_factory=list)
     issues: list[str] = field(default_factory=list)
+    issue_items: list[dict[str, Any]] = field(default_factory=list)
     tips: list[str] = field(default_factory=list)
     complete: bool = False
 
@@ -27,6 +28,7 @@ class TravelStatus:
         return {
             "missing": list(self.missing),
             "issues": list(self.issues),
+            "issue_items": [dict(item) for item in list(self.issue_items or []) if isinstance(item, dict)],
             "tips": list(self.tips),
             "complete": bool(self.complete),
         }

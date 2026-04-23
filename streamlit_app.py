@@ -21,6 +21,7 @@ from app.usecases import dto as usecase_dto
 from app.usecases import material_agent as material_usecase
 from app.usecases import task_orchestration
 from app.usecases import travel_agent as travel_usecase
+from app.usecases import travel_chat_service as travel_chat_usecase
 
 LINE_ITEM_FIELDS = ["item_name", "spec", "quantity", "unit", "line_total_with_tax"]
 UPLOAD_TYPES = ["pdf", "png", "jpg", "jpeg", "webp"]
@@ -3827,6 +3828,8 @@ def _render_travel_workbench() -> dict[str, Any]:
     manual_slot_overrides = dict(workspace.get("manual_slot_overrides") or {})
     guide_payload = dict(workspace.get("guide_payload") or {})
     scope_name = _travel_scope_name(active_task_id)
+    debug_default = str(os.getenv("DEBUG_TRAVEL_CHAT") or "").strip().lower() in TRUE_VALUES
+    debug_enabled = bool(workspace.get("travel_chat_debug", debug_default))
 
     center_col, right_col = st.columns([1.7, 1], gap="large")
     with center_col:
@@ -3907,7 +3910,11 @@ def _render_travel_workbench() -> dict[str, Any]:
             }
         )
 
-    status = _build_travel_agent_status(assignment) if pool_list else {"missing": [], "issues": [], "tips": [], "complete": False}
+    status = (
+        _build_travel_agent_status(assignment)
+        if pool_list
+        else {"missing": [], "issues": [], "issue_items": [], "tips": [], "complete": False}
+    )
     pending_actions = [item for item in _get_pending_actions(scope_name) if str(item.get("status") or "pending") == "pending"]
     if guide_payload and pool_list:
         handoff_token = f"{str(guide_payload.get('recommended_flow') or '')}|{current_signature}|{len(pool_list)}"
@@ -3960,6 +3967,29 @@ def _render_travel_workbench() -> dict[str, Any]:
         if guide_payload:
             with st.expander("查看首页立案摘要", expanded=False):
                 st.json(guide_payload)
+        with st.expander("开发调试（Travel Chat）", expanded=False):
+            previous_debug = debug_enabled
+            debug_enabled = st.checkbox(
+                "开启 DEBUG_TRAVEL_CHAT",
+                value=bool(debug_enabled),
+                key=f"travel_chat_debug_toggle_{active_task_id}",
+            )
+            workspace["travel_chat_debug"] = bool(debug_enabled)
+            if debug_enabled != previous_debug:
+                task_hub.save_travel_workspace(active_task_id, workspace)
+            st.caption("开启后会展示用户输入、解析结果和执行 payload。")
+            if debug_enabled:
+                debug_data = dict(workspace.get("travel_chat_last_debug") or {})
+                if debug_data:
+                    st.markdown("最近一次追问调试信息：")
+                    st.markdown("**用户原始输入**")
+                    st.code(str(debug_data.get("user_input") or ""))
+                    st.markdown("**parse_travel_chat_query 输出**")
+                    st.json(dict(debug_data.get("query") or {}))
+                    st.markdown("**execute_travel_chat_query payload**")
+                    st.json(dict(debug_data.get("payload") or {}))
+                else:
+                    st.info("当前还没有可展示的追问调试数据。")
         if not pool_list:
             st.info("请先上传差旅材料，我会自动分类到去程/返程/酒店，并告诉你缺什么。")
         for message in messages:
@@ -3969,6 +3999,57 @@ def _render_travel_workbench() -> dict[str, Any]:
         user_input = st.chat_input("例如：我现在还缺什么？", key=f"travel_agent_chat_input_{active_task_id}")
         if user_input:
             messages.append({"role": "user", "content": user_input})
+            quick_intent = classify_user_message_intent(
+                user_input,
+                {
+                    "domain": "travel",
+                    "missing_count": len(status.get("missing") or []),
+                    "issue_count": len(status.get("issues") or []),
+                    "pending_count": len(pending_actions),
+                },
+            )
+            if str(quick_intent.intent_type or "chat") == "chat":
+                chat_context = travel_chat_usecase.ensure_travel_chat_context(workspace.get("travel_chat_context"))
+                chat_query = travel_chat_usecase.parse_travel_chat_query(
+                    user_input,
+                    {
+                        "assignment": assignment,
+                        "status": status,
+                        "profile_count": len(profiles),
+                        "chat_context": chat_context.model_dump(),
+                    },
+                )
+                chat_payload = travel_chat_usecase.execute_travel_chat_query(chat_query, assignment, status)
+                next_chat_context = travel_chat_usecase.update_travel_chat_context(chat_context, chat_query, chat_payload)
+                workspace["travel_chat_context"] = next_chat_context.model_dump()
+                workspace["travel_chat_last_debug"] = {
+                    "user_input": user_input,
+                    "context_before": chat_context.model_dump(),
+                    "query": chat_query.model_dump(),
+                    "payload": dict(chat_payload or {}),
+                    "context_after": next_chat_context.model_dump(),
+                }
+                chat_reply = travel_chat_usecase.render_travel_chat_answer(chat_payload).strip()
+                messages.append(
+                    {
+                        "role": "assistant",
+                        "content": chat_reply
+                        or "我还不确定你的具体问题。你可以问：还缺什么、酒店发票是哪几个文件、哪些金额对不上。",
+                    }
+                )
+                _save_travel_workspace_snapshot(
+                    active_task_id,
+                    workspace=workspace,
+                    pool_list=pool_list,
+                    messages=messages,
+                    assignment=assignment,
+                    profiles=profiles,
+                    manual_overrides=manual_overrides,
+                    manual_slot_overrides=manual_slot_overrides,
+                    current_signature=current_signature,
+                    guide_payload=guide_payload,
+                )
+                st.rerun()
             plan_ok, plan_payload, plan_summary, plan_commands = _run_conversation_agent_task(
                 "plan_travel_turn",
                 {

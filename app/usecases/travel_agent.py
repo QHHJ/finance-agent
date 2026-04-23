@@ -189,6 +189,42 @@ def build_assignment_from_profiles(profiles: list[dict[str, Any]]) -> dict[str, 
     }
 
 
+def _basename(value: str) -> str:
+    source = str(value or "").strip()
+    if not source:
+        return ""
+    parts = re.split(r"[\\/]+", source)
+    return parts[-1] if parts else source
+
+
+def _extract_file_name(item: Any) -> str:
+    if isinstance(item, str):
+        return _basename(item)
+    if isinstance(item, dict):
+        for key in ["name", "filename", "file_name", "path"]:
+            value = item.get(key)
+            if value:
+                return _basename(str(value))
+        return ""
+    for attr in ["name", "filename", "file_name", "path"]:
+        value = getattr(item, attr, None)
+        if value:
+            return _basename(str(value))
+    return ""
+
+
+def _slot_file_refs(assignment: dict[str, Any], slot: str, limit: int = 6) -> list[str]:
+    values = as_uploaded_list(assignment.get(slot))
+    refs: list[str] = []
+    for item in values:
+        name = _extract_file_name(item)
+        if name:
+            refs.append(name)
+    if limit > 0:
+        return refs[:limit]
+    return refs
+
+
 def organize_materials(
     pool_files: list[Any],
     *,
@@ -218,23 +254,64 @@ def build_travel_agent_status(assignment: dict[str, Any]) -> dict[str, Any]:
     missing = [label for key, label in required_slots if not as_uploaded_list(assignment.get(key))]
 
     issues: list[str] = []
+    issue_items: list[dict[str, Any]] = []
     comparisons = [
-        ("去程交通", assignment.get("go_ticket_amount"), assignment.get("go_payment_amount")),
-        ("返程交通", assignment.get("return_ticket_amount"), assignment.get("return_payment_amount")),
-        ("酒店", assignment.get("hotel_invoice_amount"), assignment.get("hotel_payment_amount")),
+        (
+            "go",
+            "去程交通票据金额与支付记录金额不一致",
+            "amount_mismatch",
+            assignment.get("go_ticket_amount"),
+            assignment.get("go_payment_amount"),
+            ["go_ticket", "go_payment"],
+        ),
+        (
+            "return",
+            "返程交通票据金额与支付记录金额不一致",
+            "amount_mismatch",
+            assignment.get("return_ticket_amount"),
+            assignment.get("return_payment_amount"),
+            ["return_ticket", "return_payment"],
+        ),
+        (
+            "hotel",
+            "酒店票据金额与支付记录金额不一致",
+            "amount_mismatch",
+            assignment.get("hotel_invoice_amount"),
+            assignment.get("hotel_payment_amount"),
+            ["hotel_invoice", "hotel_payment"],
+        ),
     ]
-    for name, left, right in comparisons:
+    for scope, label, kind, left, right, ref_slots in comparisons:
         if left is None or right is None:
             continue
         if abs(float(left) - float(right)) > 0.01:
-            issues.append(f"{name}票据金额与支付记录金额不一致：{format_amount(left)} vs {format_amount(right)}")
+            issues.append(f"{label}：{format_amount(left)} vs {format_amount(right)}")
+            refs: list[str] = []
+            for slot in ref_slots:
+                refs.extend(_slot_file_refs(assignment, slot, limit=3))
+            issue_items.append(
+                {
+                    "scope": scope,
+                    "kind": kind,
+                    "label": label,
+                    "invoice_amount": float(left),
+                    "payment_amount": float(right),
+                    "file_refs": refs[:8],
+                }
+            )
 
     unknown_files = as_uploaded_list(assignment.get("unknown"))
     tips: list[str] = []
     if unknown_files:
         tips.append(f"有 {len(unknown_files)} 份材料尚未识别到明确类型，可在聊天区说明用途后重传。")
 
-    status = TravelStatus(missing=missing, issues=issues, tips=tips, complete=not missing and not issues)
+    status = TravelStatus(
+        missing=missing,
+        issues=issues,
+        issue_items=issue_items,
+        tips=tips,
+        complete=not missing and not issues,
+    )
     return status.to_dict()
 
 
