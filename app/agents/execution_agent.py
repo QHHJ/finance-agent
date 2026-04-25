@@ -109,7 +109,10 @@ class ExecutionAgent(BaseAgent):
 
         summary = f"已执行 {total_changed} 项差旅调整。"
         if slot_changed_count > 0 and target_slot:
-            summary += f" 槽位已调整到 {target_slot}。"
+            if str(target_slot) == "multiple_slots":
+                summary += " 已完成多项槽位调整。"
+            else:
+                summary += f" 槽位已调整到 {target_slot}。"
         elif changed_count > 0 and target_doc_type:
             summary += f" 分类已调整到 {target_doc_type}。"
         elif amount_changed_count > 0 and manual_amount is not None:

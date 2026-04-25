@@ -1,0 +1,476 @@
+{
+  "generated_at": "2026-04-25 10:01:50",
+  "elapsed_sec": 1416.079,
+  "avg_latency_sec": 22.84,
+  "sample_count": 62,
+  "dataset_support": {
+    "go_detail": 7,
+    "go_payment": 2,
+    "go_ticket": 14,
+    "hotel_invoice": 10,
+    "hotel_order": 4,
+    "hotel_payment": 10,
+    "return_detail": 2,
+    "return_payment": 4,
+    "return_ticket": 9
+  },
+  "environment": {
+    "dataset_root": "E:\\code documents\\agent caiwu\\finance-agent\\test dataset",
+    "base_url": "http://127.0.0.1:11434",
+    "ocr_model": "qwen2.5vl:3b",
+    "text_model": "qwen2.5:7b-instruct",
+    "vl_model": "qwen2.5vl:3b",
+    "disable_vl_fallback": false,
+    "classify_min_text_chars": 50,
+    "classify_min_confidence": 0.55,
+    "invoice_refine_min_confidence": 0.62,
+    "transport_refine_min_confidence": 0.58,
+    "hotel_refine_min_confidence": 0.58,
+    "direction_min_confidence": 0.5,
+    "max_pages": 2,
+    "render_scale": 2.0
+  },
+  "metrics": {
+    "final_label": {
+      "scored": 62,
+      "correct": 34,
+      "accuracy": 0.5484,
+      "macro_f1": 0.7509,
+      "labels": [
+        "go_ticket",
+        "go_payment",
+        "go_detail",
+        "return_ticket",
+        "return_payment",
+        "return_detail",
+        "hotel_invoice",
+        "hotel_payment",
+        "hotel_order",
+        "__unknown__"
+      ],
+      "confusion_matrix": {
+        "go_ticket": {
+          "go_ticket": 9,
+          "go_payment": 0,
+          "go_detail": 0,
+          "return_ticket": 5,
+          "return_payment": 0,
+          "return_detail": 0,
+          "hotel_invoice": 0,
+          "hotel_payment": 0,
+          "hotel_order": 0,
+          "__unknown__": 0
+        },
+        "go_payment": {
+          "go_ticket": 0,
+          "go_payment": 1,
+          "go_detail": 0,
+          "return_ticket": 0,
+          "return_payment": 0,
+          "return_detail": 0,
+          "hotel_invoice": 0,
+          "hotel_payment": 0,
+          "hotel_order": 0,
+          "__unknown__": 1
+        },
+        "go_detail": {
+          "go_ticket": 0,
+          "go_payment": 0,
+          "go_detail": 0,
+          "return_ticket": 0,
+          "return_payment": 0,
+          "return_detail": 0,
+          "hotel_invoice": 0,
+          "hotel_payment": 0,
+          "hotel_order": 0,
+          "__unknown__": 7
+        },
+        "return_ticket": {
+          "go_ticket": 0,
+          "go_payment": 0,
+          "go_detail": 0,
+          "return_ticket": 9,
+          "return_payment": 0,
+          "return_detail": 0,
+          "hotel_invoice": 0,
+          "hotel_payment": 0,
+          "hotel_order": 0,
+          "__unknown__": 0
+        },
+        "return_payment": {
+          "go_ticket": 0,
+          "go_payment": 0,
+          "go_detail": 0,
+          "return_ticket": 0,
+          "return_payment": 0,
+          "return_detail": 0,
+          "hotel_invoice": 0,
+          "hotel_payment": 0,
+          "hotel_order": 0,
+          "__unknown__": 4
+        },
+        "return_detail": {
+          "go_ticket": 0,
+          "go_payment": 0,
+          "go_detail": 0,
+          "return_ticket": 0,
+          "return_payment": 0,
+          "return_detail": 0,
+          "hotel_invoice": 0,
+          "hotel_payment": 0,
+          "hotel_order": 0,
+          "__unknown__": 2
+        },
+        "hotel_invoice": {
+          "go_ticket": 0,
+          "go_payment": 0,
+          "go_detail": 0,
+          "return_ticket": 0,
+          "return_payment": 0,
+          "return_detail": 0,
+          "hotel_invoice": 6,
+          "hotel_payment": 0,
+          "hotel_order": 0,
+          "__unknown__": 4
+        },
+        "hotel_payment": {
+          "go_ticket": 0,
+          "go_payment": 0,
+          "go_detail": 0,
+          "return_ticket": 0,
+          "return_payment": 0,
+          "return_detail": 0,
+          "hotel_invoice": 1,
+          "hotel_payment": 6,
+          "hotel_order": 0,
+          "__unknown__": 3
+        },
+        "hotel_order": {
+          "go_ticket": 0,
+          "go_payment": 0,
+          "go_detail": 0,
+          "return_ticket": 0,
+          "return_payment": 0,
+          "return_detail": 0,
+          "hotel_invoice": 1,
+          "hotel_payment": 0,
+          "hotel_order": 3,
+          "__unknown__": 0
+        },
+        "__unknown__": {
+          "go_ticket": 0,
+          "go_payment": 0,
+          "go_detail": 0,
+          "return_ticket": 0,
+          "return_payment": 0,
+          "return_detail": 0,
+          "hotel_invoice": 0,
+          "hotel_payment": 0,
+          "hotel_order": 0,
+          "__unknown__": 0
+        }
+      },
+      "per_class": {
+        "go_ticket": {
+          "support": 14,
+          "tp": 9,
+          "fp": 0,
+          "fn": 5,
+          "precision": 1.0,
+          "recall": 0.6429,
+          "f1": 0.7826
+        },
+        "go_payment": {
+          "support": 2,
+          "tp": 1,
+          "fp": 0,
+          "fn": 1,
+          "precision": 1.0,
+          "recall": 0.5,
+          "f1": 0.6667
+        },
+        "go_detail": {
+          "support": 7,
+          "tp": 0,
+          "fp": 0,
+          "fn": 7,
+          "precision": null,
+          "recall": 0.0,
+          "f1": null
+        },
+        "return_ticket": {
+          "support": 9,
+          "tp": 9,
+          "fp": 5,
+          "fn": 0,
+          "precision": 0.6429,
+          "recall": 1.0,
+          "f1": 0.7826
+        },
+        "return_payment": {
+          "support": 4,
+          "tp": 0,
+          "fp": 0,
+          "fn": 4,
+          "precision": null,
+          "recall": 0.0,
+          "f1": null
+        },
+        "return_detail": {
+          "support": 2,
+          "tp": 0,
+          "fp": 0,
+          "fn": 2,
+          "precision": null,
+          "recall": 0.0,
+          "f1": null
+        },
+        "hotel_invoice": {
+          "support": 10,
+          "tp": 6,
+          "fp": 2,
+          "fn": 4,
+          "precision": 0.75,
+          "recall": 0.6,
+          "f1": 0.6667
+        },
+        "hotel_payment": {
+          "support": 10,
+          "tp": 6,
+          "fp": 0,
+          "fn": 4,
+          "precision": 1.0,
+          "recall": 0.6,
+          "f1": 0.75
+        },
+        "hotel_order": {
+          "support": 4,
+          "tp": 3,
+          "fp": 0,
+          "fn": 1,
+          "precision": 1.0,
+          "recall": 0.75,
+          "f1": 0.8571
+        },
+        "__unknown__": {
+          "support": 0,
+          "tp": 0,
+          "fp": 21,
+          "fn": 0,
+          "precision": 0.0,
+          "recall": null,
+          "f1": null
+        }
+      }
+    },
+    "doc_type": {
+      "scored": 62,
+      "correct": 46,
+      "accuracy": 0.7419,
+      "macro_f1": 0.6966,
+      "labels": [
+        "transport_ticket",
+        "transport_payment",
+        "flight_detail",
+        "hotel_invoice",
+        "hotel_payment",
+        "hotel_order",
+        "unknown"
+      ],
+      "confusion_matrix": {
+        "transport_ticket": {
+          "transport_ticket": 23,
+          "transport_payment": 0,
+          "flight_detail": 0,
+          "hotel_invoice": 0,
+          "hotel_payment": 0,
+          "hotel_order": 0,
+          "unknown": 0
+        },
+        "transport_payment": {
+          "transport_ticket": 2,
+          "transport_payment": 2,
+          "flight_detail": 2,
+          "hotel_invoice": 0,
+          "hotel_payment": 0,
+          "hotel_order": 0,
+          "unknown": 0
+        },
+        "flight_detail": {
+          "transport_ticket": 3,
+          "transport_payment": 0,
+          "flight_detail": 6,
+          "hotel_invoice": 0,
+          "hotel_payment": 0,
+          "hotel_order": 0,
+          "unknown": 0
+        },
+        "hotel_invoice": {
+          "transport_ticket": 4,
+          "transport_payment": 0,
+          "flight_detail": 0,
+          "hotel_invoice": 6,
+          "hotel_payment": 0,
+          "hotel_order": 0,
+          "unknown": 0
+        },
+        "hotel_payment": {
+          "transport_ticket": 0,
+          "transport_payment": 3,
+          "flight_detail": 0,
+          "hotel_invoice": 1,
+          "hotel_payment": 6,
+          "hotel_order": 0,
+          "unknown": 0
+        },
+        "hotel_order": {
+          "transport_ticket": 0,
+          "transport_payment": 0,
+          "flight_detail": 0,
+          "hotel_invoice": 1,
+          "hotel_payment": 0,
+          "hotel_order": 3,
+          "unknown": 0
+        },
+        "unknown": {
+          "transport_ticket": 0,
+          "transport_payment": 0,
+          "flight_detail": 0,
+          "hotel_invoice": 0,
+          "hotel_payment": 0,
+          "hotel_order": 0,
+          "unknown": 0
+        }
+      },
+      "per_class": {
+        "transport_ticket": {
+          "support": 23,
+          "tp": 23,
+          "fp": 9,
+          "fn": 0,
+          "precision": 0.7188,
+          "recall": 1.0,
+          "f1": 0.8364
+        },
+        "transport_payment": {
+          "support": 6,
+          "tp": 2,
+          "fp": 3,
+          "fn": 4,
+          "precision": 0.4,
+          "recall": 0.3333,
+          "f1": 0.3636
+        },
+        "flight_detail": {
+          "support": 9,
+          "tp": 6,
+          "fp": 2,
+          "fn": 3,
+          "precision": 0.75,
+          "recall": 0.6667,
+          "f1": 0.7059
+        },
+        "hotel_invoice": {
+          "support": 10,
+          "tp": 6,
+          "fp": 2,
+          "fn": 4,
+          "precision": 0.75,
+          "recall": 0.6,
+          "f1": 0.6667
+        },
+        "hotel_payment": {
+          "support": 10,
+          "tp": 6,
+          "fp": 0,
+          "fn": 4,
+          "precision": 1.0,
+          "recall": 0.6,
+          "f1": 0.75
+        },
+        "hotel_order": {
+          "support": 4,
+          "tp": 3,
+          "fp": 0,
+          "fn": 1,
+          "precision": 1.0,
+          "recall": 0.75,
+          "f1": 0.8571
+        },
+        "unknown": {
+          "support": 0,
+          "tp": 0,
+          "fp": 0,
+          "fn": 0,
+          "precision": null,
+          "recall": null,
+          "f1": null
+        }
+      }
+    },
+    "direction": {
+      "scored": 38,
+      "correct": 19,
+      "accuracy": 0.5,
+      "macro_f1": 0.6134,
+      "labels": [
+        "go",
+        "return",
+        "unknown"
+      ],
+      "confusion_matrix": {
+        "go": {
+          "go": 10,
+          "return": 5,
+          "unknown": 8
+        },
+        "return": {
+          "go": 0,
+          "return": 9,
+          "unknown": 6
+        },
+        "unknown": {
+          "go": 0,
+          "return": 0,
+          "unknown": 0
+        }
+      },
+      "per_class": {
+        "go": {
+          "support": 23,
+          "tp": 10,
+          "fp": 0,
+          "fn": 13,
+          "precision": 1.0,
+          "recall": 0.4348,
+          "f1": 0.6061
+        },
+        "return": {
+          "support": 15,
+          "tp": 9,
+          "fp": 5,
+          "fn": 6,
+          "precision": 0.6429,
+          "recall": 0.6,
+          "f1": 0.6207
+        },
+        "unknown": {
+          "support": 0,
+          "tp": 0,
+          "fp": 14,
+          "fn": 0,
+          "precision": 0.0,
+          "recall": null,
+          "f1": null
+        }
+      }
+    }
+  },
+  "files": {
+    "predictions_csv": "E:\\code documents\\agent caiwu\\finance-agent\\benchmark\\travel_llm_v6_full\\travel_doc_cls_20260425_100150\\predictions.csv",
+    "final_confusion_csv": "E:\\code documents\\agent caiwu\\finance-agent\\benchmark\\travel_llm_v6_full\\travel_doc_cls_20260425_100150\\confusion_final_label.csv",
+    "doc_type_confusion_csv": "E:\\code documents\\agent caiwu\\finance-agent\\benchmark\\travel_llm_v6_full\\travel_doc_cls_20260425_100150\\confusion_doc_type.csv",
+    "direction_confusion_csv": "E:\\code documents\\agent caiwu\\finance-agent\\benchmark\\travel_llm_v6_full\\travel_doc_cls_20260425_100150\\confusion_direction.csv",
+    "badcases_json": "E:\\code documents\\agent caiwu\\finance-agent\\benchmark\\travel_llm_v6_full\\travel_doc_cls_20260425_100150\\badcases.json"
+  }
+}

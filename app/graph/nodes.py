@@ -328,7 +328,7 @@ def parse_pdf_node(state: FinanceGraphState) -> FinanceGraphState:
     task = repo.get_task(db, state["task_id"])
     if not task:
         raise ValueError(f"Task not found: {state['task_id']}")
-    raw_text = parser.parse_pdf_text(task.stored_path)
+    raw_text = parser.parse_file_text(task.stored_path)
     return {"raw_text": raw_text}
 
 

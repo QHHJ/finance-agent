@@ -1,0 +1,237 @@
+[
+  {
+    "sample_id": "go_detail_0002",
+    "file_path": "test dataset/go_detail/Snipaste_2026-04-22_18-39-13.png",
+    "truth_label": "go_detail",
+    "truth_doc_type": "flight_detail",
+    "truth_direction": "go",
+    "pred_label": "__unknown__",
+    "pred_doc_type": "flight_detail",
+    "pred_direction": "unknown",
+    "doc_type_confidence": 0.86,
+    "direction_confidence": 0.5,
+    "source": "llm_text",
+    "evidence": "CZ6553 Airbus A320, PVG Pudong International Airport T2, RAKHMATULLIN/ILIAS, PLAKHOVA/TATIANA, Change, Refund",
+    "ocr_chars": 262,
+    "timing_ocr_sec": 4.177,
+    "timing_doc_type_sec": 9.336,
+    "timing_direction_sec": 0.862,
+    "timing_total_sec": 14.376,
+    "error": "",
+    "_raw_text": "Confirmed\nOrder No.OM2KNH4BW10TNA907690\n16:30\nCGQ Longjia International\nAirport T2\nChina Southern Airlines\nCZ6553 Airbus A320\n19:35\nPVG Pudong International\nAirport T2\nPassengers\nRAKHMATULLIN/ILIAS\nPassport 7******\nPLAKHOVA/TATIANA\nPassport 7******\nChange\nRefund",
+    "_route_pairs": []
+  },
+  {
+    "sample_id": "go_detail_0003",
+    "file_path": "test dataset/go_detail/Snipaste_2026-04-22_18-41-05.png",
+    "truth_label": "go_detail",
+    "truth_doc_type": "flight_detail",
+    "truth_direction": "go",
+    "pred_label": "__unknown__",
+    "pred_doc_type": "flight_detail",
+    "pred_direction": "unknown",
+    "doc_type_confidence": 0.86,
+    "direction_confidence": 0.75,
+    "source": "llm_text",
+    "evidence": "机票价(经济舱8.4折、已减¥205) ¥1845 ×1人 机建 ¥50 ×1人 燃油 ¥70 ×1人; transport_refine:机票价(经济舱8.4折、已减¥205)\n¥1845 ×1人\n机建\n¥50 ×1人\n燃油\n¥70 ×1人",
+    "ocr_chars": 176,
+    "timing_ocr_sec": 4.161,
+    "timing_doc_type_sec": 7.01,
+    "timing_direction_sec": 0.833,
+    "timing_total_sec": 13.532,
+    "error": "",
+    "_raw_text": "下单金额\n05-23 16:18\n支付方式：工商银行(1965\n成人\n¥1965 ×1人\n机票价(经济舱8.4折、已减¥205)\n¥1845 ×1人\n机建\n¥50 ×1人\n燃油\n¥70 ×1人\n机场美食券\n¥0 ×1\n赠接送机82折券\n¥0 ×1份\n奔驰豪华车型立减100券\n¥0 ×1份\n租车600满减券\n¥0 ×1份\n支付方式\n工商银行(1965)",
+    "_route_pairs": []
+  },
+  {
+    "sample_id": "go_detail_0006",
+    "file_path": "test dataset/go_detail/Snipaste_2026-04-22_18-48-09.png",
+    "truth_label": "go_detail",
+    "truth_doc_type": "flight_detail",
+    "truth_direction": "go",
+    "pred_label": "__unknown__",
+    "pred_doc_type": "flight_detail",
+    "pred_direction": "unknown",
+    "doc_type_confidence": 0.95,
+    "direction_confidence": 0.5,
+    "source": "vl_retry_1+llm_text",
+    "evidence": "机票价(经济舱2.3折) 机建 燃油; transport_refine:机票价(经济舱2.3折) ￥500 x7人, 机建 ￥50 x7人, 燃油 ￥20 x7人",
+    "ocr_chars": 169,
+    "timing_ocr_sec": 57.951,
+    "timing_doc_type_sec": 6.225,
+    "timing_direction_sec": 0.817,
+    "timing_total_sec": 66.448,
+    "error": "",
+    "_raw_text": "交易记录\n积分&会员等级\n下单金额\n2025-05-2114:32\n支付方式：移动版支付宝￥3990\n成人\n￥570 x7人\n机票价(经济舱2.3折)\n￥500 x7人\n机建\n￥50 x7人\n燃油\n￥20 x7人\n机场美食券\n￥20 x7人\n机场美食券\n￥0 x1份\n租车最高最高减1188元\n￥0 x1份\n赠接送机82折券\n￥0 x7份",
+    "_route_pairs": []
+  },
+  {
+    "sample_id": "go_detail_0007",
+    "file_path": "test dataset/go_detail/Snipaste_2026-04-22_18-49-52.png",
+    "truth_label": "go_detail",
+    "truth_doc_type": "flight_detail",
+    "truth_direction": "go",
+    "pred_label": "__unknown__",
+    "pred_doc_type": "transport_ticket",
+    "pred_direction": "unknown",
+    "doc_type_confidence": 0.86,
+    "direction_confidence": 0.75,
+    "source": "llm_text+llm_vl_fallback",
+    "evidence": "总计¥3990",
+    "ocr_chars": 94,
+    "timing_ocr_sec": 3.725,
+    "timing_doc_type_sec": 8.531,
+    "timing_direction_sec": 0.522,
+    "timing_total_sec": 15.576,
+    "error": "",
+    "_raw_text": "10:11\n订单详情\n总计¥3990\n已购/赠送服务\n推荐\n出行信息\n出行信息\n石屹然 赵泓熙 朱洪良 王浩然 孙贺伟 刘家豪\n查看证件、票号、修改姓名/证件\n我要退订\n更改行程\n查看凭证",
+    "_route_pairs": [
+      [
+        "修改姓名",
+        "证件"
+      ]
+    ]
+  },
+  {
+    "sample_id": "go_detail_0001",
+    "file_path": "test dataset/go_detail/Snipaste_2026-04-22_18-35-56.png",
+    "truth_label": "go_detail",
+    "truth_doc_type": "flight_detail",
+    "truth_direction": "go",
+    "pred_label": "go_ticket",
+    "pred_doc_type": "transport_ticket",
+    "pred_direction": "go",
+    "doc_type_confidence": 0.86,
+    "direction_confidence": 0.75,
+    "source": "llm_text+direction_llm",
+    "evidence": "单程 5月6日 长春→北京，16:00 龙嘉机场T2, 18:15 首都机场T3，运改签、行李称、产品政策等信息表明这是一张交通票据。; invoice_refine:单程 5月6日 长春→北京; direction:单程 5月6日 长春→北京",
+    "ocr_chars": 234,
+    "timing_ocr_sec": 3.92,
+    "timing_doc_type_sec": 8.34,
+    "timing_direction_sec": 0.885,
+    "timing_total_sec": 14.023,
+    "error": "",
+    "_raw_text": "总计 ￥938\n订单号：32093280077\n复制\n订单金额：￥938.00\n运改签、行李称、产品政策\n完成订单预计积247积分\n复制\n订单号：32093280077\n复制\n单程 5月6日 长春→北京\n收起\n16:00 龙嘉机场T2\n2h15m\n18:15 首都机场T3\n全能保障服务\n0元包邮取衣商品立减券\n延误补贴服务\n优惠券\n机场美食券\n出行信息\n出行人\n何文强\n220106**********37\n身份证：999-2355875452\n复制\n修改姓名/证件",
+    "_route_pairs": [
+      [
+        "长春",
+        "北京"
+      ],
+      [
+        "修改姓名",
+        "证件"
+      ]
+    ]
+  },
+  {
+    "sample_id": "go_detail_0008",
+    "file_path": "test dataset/go_detail/去程机票明细.jpg",
+    "truth_label": "go_detail",
+    "truth_doc_type": "flight_detail",
+    "truth_direction": "go",
+    "pred_label": "return_detail",
+    "pred_doc_type": "flight_detail",
+    "pred_direction": "return",
+    "doc_type_confidence": 0.86,
+    "direction_confidence": 0.8,
+    "source": "llm_text+invoice_refine+transport_refine+direction_llm",
+    "evidence": "价格明细、总金额、普通成人、机票、燃油、机建等信息表明此文档为机票明细页。; invoice_refine:项目名称包含代订机票费; field_guard:transport:机票; transport_refine:价格明细/机建/燃油/票价; direction:行程已结束，如需要可再次预订, 单程 3月17日 周二 长春-上海",
+    "ocr_chars": 244,
+    "timing_ocr_sec": 7.601,
+    "timing_doc_type_sec": 7.842,
+    "timing_direction_sec": 1.141,
+    "timing_total_sec": 18.089,
+    "error": "",
+    "_raw_text": "16:53\n飞猪旅行\n51\n31\n订单详情\n行程已结束，如需要可再次预订\n我要改签\n我要退票\n发票报销\n再次预订\n电子凭证已发送至邮箱\n03月20日已发送至邮箱：2267125043@qq.com\n凭证详情\n退改签、行李额\n订单号 9417275362090\n复制\n单程 3月17日 周二 长春-上海\n价格明细\n搜索为\"4成人\"人均价(不含机建燃油费)￥520\n总金额\n￥2360\n普通成人\n普通成人\n￥590x4\n机票\n机票\n￥520x4\n燃油\n燃油\n￥20x4\n机建\n机建\n￥50x4",
+    "_route_pairs": [
+      [
+        "电子凭证已发送",
+        "邮箱"
+      ],
+      [
+        "日已发送",
+        "邮箱"
+      ],
+      [
+        "长春",
+        "上海"
+      ]
+    ]
+  },
+  {
+    "sample_id": "go_detail_0004",
+    "file_path": "test dataset/go_detail/Snipaste_2026-04-22_18-46-24.png",
+    "truth_label": "go_detail",
+    "truth_doc_type": "flight_detail",
+    "truth_direction": "go",
+    "pred_label": "return_ticket",
+    "pred_doc_type": "transport_ticket",
+    "pred_direction": "return",
+    "doc_type_confidence": 0.86,
+    "direction_confidence": 0.75,
+    "source": "llm_text+direction_llm",
+    "evidence": "已出票、行程信息包括长春到南京的航班详情，以及具体的出发和到达时间。; invoice_refine:项目名称包含代订机票费/客运服务/机票相关服务; direction:长春 南京 航线为A-长春，倾向 return",
+    "ocr_chars": 208,
+    "timing_ocr_sec": 4.663,
+    "timing_doc_type_sec": 7.392,
+    "timing_direction_sec": 0.932,
+    "timing_total_sec": 13.848,
+    "error": "",
+    "_raw_text": "4:05\n订单详情\n预订成功\n订单编号: 4811120505\n出行必读\n防诈骗温馨提醒\n我的报销\n已发送 2024-11-20 者出\n详情\n电子凭证 maosd@iccas.ac.cn\n行程信息\n苗世顶、郭丽丽\n长春 南京\n已出票\n2024-11-30 周六 13:45 - 16:45\n改返规则/行票\n13:45 龙嘉机场T2\n9-九元85 AQ1034\n16:45 接口机场T1\n无行李重提(2.6%) 无餐食",
+    "_route_pairs": [
+      [
+        "改返规则",
+        "行票"
+      ]
+    ]
+  },
+  {
+    "sample_id": "go_payment_0001",
+    "file_path": "test dataset/go_payment/2360元_支付凭证长春到上海机票4人.jpg",
+    "truth_label": "go_payment",
+    "truth_doc_type": "transport_payment",
+    "truth_direction": "go",
+    "pred_label": "__unknown__",
+    "pred_doc_type": "transport_ticket",
+    "pred_direction": "unknown",
+    "doc_type_confidence": 0.86,
+    "direction_confidence": 0.75,
+    "source": "llm_text+llm_vl_fallback",
+    "evidence": "上海**服",
+    "ocr_chars": 115,
+    "timing_ocr_sec": 6.565,
+    "timing_doc_type_sec": 12.904,
+    "timing_direction_sec": 0.602,
+    "timing_total_sec": 22.984,
+    "error": "",
+    "_raw_text": "16:02\n上海**服\n-2,360.00\n2026-03-13 20:09:42\n中国银行储蓄卡(1494)\n6000539866603603\n你因这笔消费解锁了“出个远门”贴纸\n开通记账本，自动生成标签统计报告\n计入收支\n备注",
+    "_route_pairs": []
+  },
+  {
+    "sample_id": "go_payment_0002",
+    "file_path": "test dataset/go_payment/Snipaste_2026-04-22_18-36-06.png",
+    "truth_label": "go_payment",
+    "truth_doc_type": "transport_payment",
+    "truth_direction": "go",
+    "pred_label": "__unknown__",
+    "pred_doc_type": "transport_payment",
+    "pred_direction": "unknown",
+    "doc_type_confidence": 0.55,
+    "direction_confidence": 0.5,
+    "source": "llm_text",
+    "evidence": "fallback:label_in_response",
+    "ocr_chars": 239,
+    "timing_ocr_sec": 4.469,
+    "timing_doc_type_sec": 11.791,
+    "timing_direction_sec": 1.318,
+    "timing_total_sec": 17.578,
+    "error": "",
+    "_raw_text": "明细\n支出金额(人民币元)\n935.00\n交易账户\n借记卡 6235 ******\n7912\n交易后余额\n人民币元 41,273.03\n对方名称\n程支付-携程旅行网\n对方账号\nZ200 ******\n015N\n交易类型\n网上快捷支付\n交易渠道/场所\n携程对接\n附言\n程支付-携程旅行网\n交易时间\n2024/05/02 13:27:12\n可情况分类、备注、所属地本、交易对象和计入收支情况\n分类\n自行\n修改\n交易备注\n修改\n所属地本\n选择账本\n交易对象\n本人\n修改\n计入收支\n计入",
+    "_route_pairs": [
+      [
+        "交易渠道",
+        "场所"
+      ]
+    ]
+  }
+]

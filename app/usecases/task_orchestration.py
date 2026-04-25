@@ -20,7 +20,7 @@ def _save_uploaded_bytes(filename: str, content: bytes, folder: Path) -> Path:
 def upload_policy_pdf(filename: str, content: bytes):
     init_runtime()
     stored_path = _save_uploaded_bytes(filename, content, POLICY_DIR)
-    raw_text = parser.parse_pdf_text(stored_path)
+    raw_text = parser.parse_file_text(stored_path, max_pages=0)
     content_hash = parser.compute_file_sha256(stored_path)
 
     db = SessionLocal()

@@ -1,14 +1,18 @@
 ﻿from __future__ import annotations
 
+import hashlib
 from datetime import datetime
-from io import BytesIO
+import os
 from pathlib import Path
+import time
 from typing import Any
 
+import requests
 import streamlit as st
-from pypdf import PdfReader
+import json
 
 from app.agents import AgentTask, ReimbursementAgentOrchestrator
+from app.services import parser as ocr_parser
 from app.ui import task_hub, workbench
 from app.usecases import home_guide_agent as guide_usecase
 from app.usecases import travel_agent as travel_usecase
@@ -35,30 +39,16 @@ def _merge_uploaded_lists(first: list[Any], second: list[Any]) -> list[Any]:
     return travel_usecase.merge_uploaded_lists(first, second)
 
 
-def _extract_pdf_text_from_bytes(file_bytes: bytes) -> str:
+def _extract_file_text_from_bytes(file_bytes: bytes, suffix: str) -> str:
     if not file_bytes:
         return ""
-    try:
-        reader = PdfReader(BytesIO(file_bytes))
-    except Exception:
-        return ""
-
-    pages: list[str] = []
-    for page in reader.pages:
-        try:
-            text = page.extract_text() or ""
-        except Exception:
-            text = ""
-        text = str(text).strip()
-        if text:
-            pages.append(text)
-    return "\n".join(chunk for chunk in pages if chunk)
+    return str(ocr_parser.parse_file_bytes(file_bytes, suffix) or "")
 
 
 @st.cache_data(show_spinner=False)
-def _extract_pdf_preview_text(file_bytes: bytes, max_chars: int = 1800) -> str:
+def _extract_file_preview_text(file_bytes: bytes, suffix: str, max_chars: int = 1800) -> str:
     try:
-        text = _extract_pdf_text_from_bytes(file_bytes)
+        text = _extract_file_text_from_bytes(file_bytes, suffix)
     except Exception:
         return ""
     value = str(text or "").strip()
@@ -76,9 +66,9 @@ def _home_guide_build_file_infos(files: list[Any]) -> list[dict[str, Any]]:
         suffix = Path(name).suffix.lower()
         size = int(getattr(item, "size", 0) or 0)
         preview = ""
-        if suffix == ".pdf":
+        if suffix in {".pdf", ".png", ".jpg", ".jpeg", ".webp", ".bmp", ".tif", ".tiff"}:
             try:
-                preview = _extract_pdf_preview_text(item.getvalue())
+                preview = _extract_file_preview_text(item.getvalue(), suffix)
             except Exception:
                 preview = ""
         infos.append(
@@ -244,6 +234,191 @@ def _extract_home_composer_submission(raw_value: Any) -> tuple[str, list[Any]]:
     return str(text_value or "").strip(), _as_uploaded_list(file_value)
 
 
+def _chat_typewriter_enabled() -> bool:
+    return str(os.getenv("CHAT_TYPEWRITER", "1")).strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _iter_typewriter_chunks(text: str):
+    source = str(text or "")
+    if not source:
+        return
+    length = len(source)
+    if length >= 1000:
+        chunk_size, pause = 18, 0.002
+    elif length >= 600:
+        chunk_size, pause = 12, 0.004
+    elif length >= 260:
+        chunk_size, pause = 6, 0.008
+    else:
+        chunk_size, pause = 2, 0.012
+    for idx in range(0, length, chunk_size):
+        yield source[idx : idx + chunk_size]
+        if pause > 0:
+            time.sleep(pause)
+
+
+def _render_typewriter_markdown(content: str) -> None:
+    holder = st.empty()
+    rendered = ""
+    for chunk in _iter_typewriter_chunks(content):
+        rendered += chunk
+        holder.markdown(rendered + "▌")
+    holder.markdown(rendered)
+
+
+@st.cache_data(show_spinner=False, ttl=60)
+def _list_ollama_model_names(base_url: str) -> list[str]:
+    try:
+        resp = requests.get(f"{str(base_url or '').rstrip('/')}/api/tags", timeout=(4, 10))
+        resp.raise_for_status()
+        payload = resp.json()
+    except Exception:
+        return []
+    models = payload.get("models") if isinstance(payload, dict) else None
+    if not isinstance(models, list):
+        return []
+    names: list[str] = []
+    for item in models:
+        if not isinstance(item, dict):
+            continue
+        name = str(item.get("name") or "").strip()
+        if name and name not in names:
+            names.append(name)
+    return names
+
+
+def _home_chat_model() -> str:
+    base_url = str(os.getenv("OLLAMA_BASE_URL", "http://127.0.0.1:11434")).rstrip("/")
+    preferred = (
+        os.getenv("OLLAMA_CHAT_MODEL")
+        or os.getenv("OLLAMA_TEXT_MODEL")
+        or os.getenv("OLLAMA_VL_MODEL")
+        or os.getenv("OLLAMA_MODEL")
+        or "qwen2.5:7b-instruct"
+    )
+    available = _list_ollama_model_names(base_url)
+    if not available:
+        return str(preferred)
+    if preferred in available:
+        return str(preferred)
+    for candidate in ["qwen2.5:7b-instruct", "qwen2.5vl:7b", "qwen2.5vl:3b"]:
+        if candidate in available:
+            return candidate
+    return available[0]
+
+
+def _generate_home_reply_llm(user_message: str, state: dict[str, Any], uploaded_files: list[Any]) -> str | None:
+    text = str(user_message or "").strip()
+    if not text:
+        return None
+
+    base_url = str(os.getenv("OLLAMA_BASE_URL", "http://127.0.0.1:11434")).rstrip("/")
+    model = _home_chat_model()
+    flow = str(state.get("recommended_flow") or "unknown")
+    reason = str(state.get("route_reason") or "")
+    identified = dict(state.get("identified_doc_types") or {})
+    history = list(state.get("conversation_history") or [])
+    file_count = len(list(uploaded_files or []))
+
+    context = {
+        "recommended_flow": flow,
+        "route_reason": reason,
+        "file_count": file_count,
+        "identified_doc_types": identified,
+    }
+    system_prompt = (
+        "你是报销首页引导助手。"
+        "回答要自然口语化，不要模板腔，不要官话。"
+        "优先用2-4句短句回答，除非用户明确要清单。"
+        "禁止编造材料状态，只能基于给定上下文。"
+    )
+    llm_messages: list[dict[str, str]] = [{"role": "system", "content": system_prompt}]
+    for item in history[-4:]:
+        if not isinstance(item, dict):
+            continue
+        role = str(item.get("role") or "")
+        content = str(item.get("content") or "").strip()
+        if role in {"user", "assistant"} and content:
+            llm_messages.append({"role": role, "content": content[:800]})
+    llm_messages.append(
+        {
+            "role": "user",
+            "content": f"当前首页状态(JSON): {json.dumps(context, ensure_ascii=False)}\n用户输入: {text}",
+        }
+    )
+
+    try:
+        payload = {
+            "model": model,
+            "stream": False,
+            "messages": llm_messages,
+            "options": {"temperature": 0.35},
+        }
+        resp = requests.post(f"{base_url}/api/chat", json=payload, timeout=(8, 60))
+        resp.raise_for_status()
+        content = str((resp.json().get("message") or {}).get("content") or "").strip()
+        if content:
+            return content
+    except Exception:
+        pass
+
+    prompt = "\n\n".join(f"[{msg.get('role')}] {msg.get('content')}" for msg in llm_messages[-6:])
+    try:
+        payload = {
+            "model": model,
+            "stream": False,
+            "prompt": prompt,
+            "options": {"temperature": 0.35},
+        }
+        resp = requests.post(f"{base_url}/api/generate", json=payload, timeout=(8, 60))
+        resp.raise_for_status()
+        content = str(resp.json().get("response") or "").strip()
+        if content:
+            return content
+    except Exception:
+        return None
+    return None
+
+
+def _render_home_chat_messages(history: list[dict[str, Any]], *, stream_state_key: str) -> None:
+    latest_assistant_idx: int | None = None
+    latest_assistant_text = ""
+    for idx in range(len(history) - 1, -1, -1):
+        item = history[idx]
+        if not isinstance(item, dict):
+            continue
+        if str(item.get("role") or "") == "assistant":
+            latest_assistant_idx = idx
+            latest_assistant_text = str(item.get("content") or "")
+            break
+
+    signature = ""
+    if latest_assistant_idx is not None:
+        digest = hashlib.sha1(latest_assistant_text.encode("utf-8", errors="ignore")).hexdigest()[:12]
+        signature = f"{len(history)}:{latest_assistant_idx}:{digest}"
+
+    last_streamed = str(st.session_state.get(stream_state_key) or "")
+    should_stream = (
+        _chat_typewriter_enabled()
+        and latest_assistant_idx is not None
+        and signature
+        and signature != last_streamed
+        and any(str((item or {}).get("role") or "") == "user" for item in history)
+    )
+
+    for idx, msg in enumerate(history):
+        role = str(msg.get("role") or "assistant")
+        content = str(msg.get("content") or "")
+        if not content:
+            continue
+        with st.chat_message(role):
+            if should_stream and idx == latest_assistant_idx:
+                _render_typewriter_markdown(content)
+                st.session_state[stream_state_key] = signature
+            else:
+                st.markdown(content)
+
+
 def _fallback_home_payload(state: dict[str, Any], files: list[Any]) -> dict[str, Any]:
     payload = dict(state.get("target_flow_payload") or {})
     if payload:
@@ -296,13 +471,10 @@ def render_home_guide_agent(upload_types: list[str]) -> None:
                 "<div class='wb-card-muted'>把问题和材料都交给底部输入框；支持一次附多个 PDF/图片。</div>",
                 unsafe_allow_html=True,
             )
-            for msg in list(state.get("conversation_history") or [])[-12:]:
-                role = str(msg.get("role") or "assistant")
-                content = str(msg.get("content") or "")
-                if not content:
-                    continue
-                with st.chat_message(role):
-                    st.markdown(content)
+            _render_home_chat_messages(
+                list(state.get("conversation_history") or [])[-12:],
+                stream_state_key=f"home_guide_chat_streamed_{str(state.get('session_id') or '')}",
+            )
 
     with intake_right:
         travel_clicked, material_clicked = workbench.render_recommendation_card(
@@ -394,6 +566,7 @@ def render_home_guide_agent(upload_types: list[str]) -> None:
                 "state": st.session_state.get("home_guide_state"),
                 "user_message": user_message,
                 "uploaded_files": file_infos,
+                "reply_llm": _generate_home_reply_llm,
             },
         )
     )

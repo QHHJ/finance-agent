@@ -1,0 +1,11 @@
+﻿true\pred,go_ticket,go_payment,go_detail,return_ticket,return_payment,return_detail,hotel_invoice,hotel_payment,hotel_order,__unknown__
+go_ticket,3,0,0,0,0,0,0,0,0,11
+go_payment,0,0,0,0,0,0,0,0,0,2
+go_detail,2,0,1,0,0,0,0,0,0,5
+return_ticket,0,0,0,0,0,0,0,0,0,9
+return_payment,1,0,0,0,0,1,0,0,0,2
+return_detail,0,0,0,0,0,0,0,0,0,2
+hotel_invoice,0,0,0,0,0,0,7,0,0,3
+hotel_payment,0,1,0,0,0,0,2,5,0,2
+hotel_order,0,0,0,0,0,0,1,3,0,0
+__unknown__,0,0,0,0,0,0,0,0,0,0
