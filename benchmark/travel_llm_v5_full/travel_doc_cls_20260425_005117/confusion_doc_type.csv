@@ -1,8 +1,0 @@
-﻿true\pred,transport_ticket,transport_payment,flight_detail,hotel_invoice,hotel_payment,hotel_order,unknown
-transport_ticket,23,0,0,0,0,0,0
-transport_payment,2,2,2,0,0,0,0
-flight_detail,4,0,6,0,0,0,0
-hotel_invoice,5,0,0,5,0,0,0
-hotel_payment,0,3,0,1,6,0,0
-hotel_order,0,0,0,1,0,3,0
-unknown,0,0,0,0,0,0,0

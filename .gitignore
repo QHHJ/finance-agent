@@ -3,3 +3,7 @@ __pycache__/
 *.pyc
 data/uploads/
 data/exports/
+data/*.db
+data/faiss_index/
+node_modules/
+benchmark/travel_llm_*/
