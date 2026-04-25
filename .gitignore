@@ -7,3 +7,5 @@ data/*.db
 data/faiss_index/
 node_modules/
 benchmark/travel_llm_*/
+机票/
+酒店/
